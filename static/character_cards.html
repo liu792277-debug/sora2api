@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>角色卡管理</title>
+  <style>
+    body{margin:0;font-family:system-ui,-apple-system,"Segoe UI",sans-serif;background:#f8fafc;color:#0f172a}
+    .page{max-width:1200px;margin:0 auto;padding:20px}
+    .header{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+    .header h1{margin:0;font-size:20px}
+    .btn{display:inline-flex;align-items:center;justify-content:center;border-radius:10px;padding:8px 14px;border:1px solid #cbd5e1;background:#fff;cursor:pointer}
+    .btn.primary{background:#0f172a;color:#fff;border-color:#0f172a}
+    .btn.danger{border-color:#ef4444;color:#ef4444}
+    .toolbar{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0}
+    .card{background:#fff;border:1px solid #e2e8f0;border-radius:14px;padding:16px;box-shadow:0 6px 18px rgba(15,23,42,0.06)}
+    .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px}
+    .role-card{position:relative;min-height:180px;border-radius:14px;overflow:hidden;background:#0f172a;color:#fff;display:flex;flex-direction:column;justify-content:flex-end}
+    .role-card::before{content:"";position:absolute;inset:0;background:rgba(15,23,42,0.45)}
+    .role-card .content{position:relative;padding:12px;z-index:1}
+    .role-card .name{font-weight:700}
+    .role-card .username{font-size:12px;opacity:.85}
+    .role-actions{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap}
+    .role-actions button{font-size:12px;padding:6px 10px}
+    .form-row{display:flex;flex-wrap:wrap;gap:10px;margin-top:10px}
+    .input{border:1px solid #cbd5e1;border-radius:10px;padding:8px 10px;min-width:220px}
+    .muted{color:#64748b;font-size:12px}
+  </style>
+</head>
+<body>
+  <div class="page">
+    <div class="header">
+      <h1>角色卡管理</h1>
+      <a class="btn" href="/static/video_generate.html">返回视频生成</a>
+    </div>
+
+    <div class="card" style="margin-top:12px;">
+      <div style="font-weight:600;">创建角色卡</div>
+      <div class="form-row">
+        <input id="baseUrl" class="input" placeholder="Base URL (例如 https://your-host)" style="flex:1" />
+        <input id="apiKey" class="input" placeholder="API Key" style="flex:1" />
+        <select id="model" class="input" style="flex:1">
+          <option value="sora2-landscape-10s">sora2-landscape-10s</option>
+          <option value="sora2-portrait-10s">sora2-portrait-10s</option>
+          <option value="sora2-landscape-15s">sora2-landscape-15s</option>
+          <option value="sora2-portrait-15s">sora2-portrait-15s</option>
+          <option value="sora2-landscape-25s">sora2-landscape-25s</option>
+          <option value="sora2-portrait-25s">sora2-portrait-25s</option>
+        </select>
+        <input id="videoFile" type="file" accept="video/*" class="input" />
+        <button id="btnCreate" class="btn primary">上传并创建</button>
+      </div>
+      <div class="muted">仅支持上传视频创建角色卡（不包含生成提示词）。</div>
+      <pre id="log" class="muted" style="white-space:pre-wrap;margin-top:10px;"></pre>
+    </div>
+
+    <div class="toolbar">
+      <button class="btn" id="btnRefresh">刷新</button>
+      <button class="btn" id="btnExport">导出 JSON</button>
+      <label class="btn">
+        导入 JSON
+        <input id="importFile" type="file" accept="application/json" style="display:none;" />
+      </label>
+      <button class="btn danger" id="btnClear">清空全部</button>
+    </div>
+
+    <div id="cardGrid" class="grid"></div>
+  </div>
+
+  <script src="/static/js/character_cards.js"></script>
+</body>
+</html>

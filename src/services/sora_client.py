@@ -845,7 +845,7 @@ class SoraClient:
         result = await self._make_request("POST", "/characters/upload", token, multipart=mp, use_proxy=False)
         return result.get("id")
 
-    async def get_cameo_status(self, cameo_id: str, token: str) -> Dict[str, Any]:
+    async def get_cameo_status(self, cameo_id: str, token: str, task_id: Optional[str] = None) -> Dict[str, Any]:
         """Get character (cameo) processing status
 
         Args:
@@ -855,9 +855,9 @@ class SoraClient:
         Returns:
             Dictionary with status, display_name_hint, username_hint, profile_asset_url, instruction_set_hint
         """
-        return await self._make_request("GET", f"/project_y/cameos/in_progress/{cameo_id}", token)
+        return await self._make_request("GET", f"/project_y/cameos/in_progress/{cameo_id}", token, task_id=task_id)
 
-    async def download_character_image(self, image_url: str) -> bytes:
+    async def download_character_image(self, image_url: str, task_id: Optional[str] = None) -> bytes:
         """Download character image from URL
 
         Args:
@@ -866,7 +866,7 @@ class SoraClient:
         Returns:
             Image file bytes
         """
-        proxy_url = await self.proxy_manager.get_proxy_url()
+        proxy_url = await self.proxy_manager.get_proxy_url(task_id=task_id)
 
         kwargs = {
             "timeout": self.timeout,
@@ -883,7 +883,8 @@ class SoraClient:
             return response.content
 
     async def finalize_character(self, cameo_id: str, username: str, display_name: str,
-                                profile_asset_pointer: str, instruction_set, token: str) -> str:
+                                profile_asset_pointer: str, instruction_set, token: str,
+                                task_id: Optional[str] = None) -> str:
         """Finalize character creation
 
         Args:
@@ -909,10 +910,10 @@ class SoraClient:
             "safety_instruction_set": None
         }
 
-        result = await self._make_request("POST", "/characters/finalize", token, json_data=json_data)
+        result = await self._make_request("POST", "/characters/finalize", token, json_data=json_data, task_id=task_id)
         return result.get("character", {}).get("character_id")
 
-    async def set_character_public(self, cameo_id: str, token: str) -> bool:
+    async def set_character_public(self, cameo_id: str, token: str, task_id: Optional[str] = None) -> bool:
         """Set character as public
 
         Args:
@@ -923,7 +924,7 @@ class SoraClient:
             True if successful
         """
         json_data = {"visibility": "public"}
-        await self._make_request("POST", f"/project_y/cameos/by_id/{cameo_id}/update_v2", token, json_data=json_data)
+        await self._make_request("POST", f"/project_y/cameos/by_id/{cameo_id}/update_v2", token, json_data=json_data, task_id=task_id)
         return True
 
     async def upload_character_image(self, image_data: bytes, token: str) -> str:

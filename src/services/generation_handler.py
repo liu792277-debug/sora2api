@@ -448,10 +448,7 @@ class GenerationHandler:
                         yield chunk
                     return
                 else:
-                    # If prompt provided, create character and generate video
-                    async for chunk in self._handle_character_and_video_generation(video_data, prompt, model_config):
-                        yield chunk
-                    return
+                    raise Exception("角色卡创建仅支持视频上传，不允许同时提交提示词生成视频。")
 
         # Streaming mode: proceed with actual generation
         # Check if model requires Pro subscription
@@ -1446,6 +1443,30 @@ class GenerationHandler:
             raise Exception("No available tokens for character creation")
 
         start_time = time.time()
+        task_proxy_key = str(uuid4())
+        task_id = None
+        profile_asset_url = None
+
+        def _should_rotate_proxy(error: Exception) -> bool:
+            msg = str(error)
+            match = re.search(r"(?:API request failed:|HTTP Error:)\s*(\d{3})", msg)
+            if match:
+                code = int(match.group(1))
+                return code in (403, 429) or code >= 500
+            return False
+
+        async def _call_with_retry(fn, *args, **kwargs):
+            last_exc = None
+            for _ in range(3):
+                try:
+                    return await fn(*args, **kwargs)
+                except Exception as exc:
+                    last_exc = exc
+                    if task_id and self.proxy_manager and _should_rotate_proxy(exc):
+                        self.proxy_manager.rotate_task_proxy(task_id)
+                        continue
+                    raise
+            raise last_exc
         try:
             yield self._format_stream_chunk(
                 reasoning_content="**Character Creation Begins**\n\nInitializing character creation...\n",
@@ -1468,12 +1489,15 @@ class GenerationHandler:
             )
             cameo_id = await self.sora_client.upload_character_video(video_bytes, token_obj.token)
             debug_logger.log_info(f"Video uploaded, cameo_id: {cameo_id}")
+            task_id = cameo_id
+            if self.proxy_manager:
+                self.proxy_manager.bind_task_proxy(task_proxy_key, task_id)
 
             # Step 2: Poll for character processing
             yield self._format_stream_chunk(
                 reasoning_content="Processing video to extract character...\n"
             )
-            cameo_status = await self._poll_cameo_status(cameo_id, token_obj.token)
+            cameo_status = await self._poll_cameo_status(cameo_id, token_obj.token, task_id=task_id)
             debug_logger.log_info(f"Cameo status: {cameo_status}")
 
             # Extract character info immediately after polling completes
@@ -1496,7 +1520,11 @@ class GenerationHandler:
             if not profile_asset_url:
                 raise Exception("Profile asset URL not found in cameo status")
 
-            avatar_data = await self.sora_client.download_character_image(profile_asset_url)
+            avatar_data = await _call_with_retry(
+                self.sora_client.download_character_image,
+                profile_asset_url,
+                task_id=task_id,
+            )
             debug_logger.log_info(f"Avatar downloaded, size: {len(avatar_data)} bytes")
 
             # Step 4: Upload avatar
@@ -1513,13 +1541,15 @@ class GenerationHandler:
             # instruction_set_hint is a string, but instruction_set in cameo_status might be an array
             instruction_set = cameo_status.get("instruction_set_hint") or cameo_status.get("instruction_set")
 
-            character_id = await self.sora_client.finalize_character(
+            character_id = await _call_with_retry(
+                self.sora_client.finalize_character,
                 cameo_id=cameo_id,
                 username=username,
                 display_name=display_name,
                 profile_asset_pointer=asset_pointer,
                 instruction_set=instruction_set,
-                token=token_obj.token
+                token=token_obj.token,
+                task_id=task_id,
             )
             debug_logger.log_info(f"Character finalized, character_id: {character_id}")
 
@@ -1527,7 +1557,7 @@ class GenerationHandler:
             yield self._format_stream_chunk(
                 reasoning_content="Setting character as public...\n"
             )
-            await self.sora_client.set_character_public(cameo_id, token_obj.token)
+            await _call_with_retry(self.sora_client.set_character_public, cameo_id, token_obj.token, task_id=task_id)
             debug_logger.log_info(f"Character set as public")
 
             # Log successful character creation
@@ -1551,6 +1581,17 @@ class GenerationHandler:
             )
 
             # Step 7: Return success message
+            event_payload = {
+                "event": "character_card",
+                "card": {
+                    "display_name": display_name,
+                    "username": username,
+                    "cameo_id": cameo_id,
+                    "character_id": character_id,
+                    "profile_asset_url": profile_asset_url,
+                },
+            }
+            yield f"data: {json.dumps(event_payload, ensure_ascii=False)}\n\n"
             yield self._format_stream_chunk(
                 content=f"角色创建成功，角色名@{username}",
                 finish_reason="STOP"
@@ -1603,6 +1644,10 @@ class GenerationHandler:
                 response_text=str(e)
             )
             raise
+        finally:
+            if self.proxy_manager:
+                self.proxy_manager.release_task_proxy(task_id)
+                self.proxy_manager.release_task_proxy(task_proxy_key)
 
     async def _handle_character_and_video_generation(self, video_data, prompt: str, model_config: Dict) -> AsyncGenerator[str, None]:
         """Handle character creation and video generation
@@ -1953,7 +1998,8 @@ class GenerationHandler:
                 self.proxy_manager.release_task_proxy(task_id)
                 self.proxy_manager.release_task_proxy(task_proxy_key)
 
-    async def _poll_cameo_status(self, cameo_id: str, token: str, timeout: int = 600, poll_interval: int = 5) -> Dict[str, Any]:
+    async def _poll_cameo_status(self, cameo_id: str, token: str, timeout: int = 600, poll_interval: int = 5,
+                                 task_id: Optional[str] = None) -> Dict[str, Any]:
         """Poll for cameo (character) processing status
 
         Args:
@@ -1978,7 +2024,7 @@ class GenerationHandler:
             await asyncio.sleep(poll_interval)
 
             try:
-                status = await self.sora_client.get_cameo_status(cameo_id, token)
+                status = await self.sora_client.get_cameo_status(cameo_id, token, task_id=task_id)
                 current_status = status.get("status")
                 status_message = status.get("status_message", "")
 
@@ -2016,6 +2062,14 @@ class GenerationHandler:
                 # These should be raised immediately, not retried
                 if "角色创建失败" in error_msg:
                     raise
+
+                # Rotate proxy on 403/429/5xx
+                if task_id and self.proxy_manager:
+                    match = re.search(r"(?:API request failed:|HTTP Error:)\s*(\d{3})", error_msg)
+                    if match:
+                        code = int(match.group(1))
+                        if code in (403, 429) or code >= 500:
+                            self.proxy_manager.rotate_task_proxy(task_id)
 
                 # Log error with context
                 debug_logger.log_error(
