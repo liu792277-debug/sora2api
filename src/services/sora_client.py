@@ -360,7 +360,8 @@ class SoraClient:
                            multipart: Optional[Dict] = None,
                            add_sentinel_token: bool = False,
                            token_id: Optional[int] = None,
-                           task_id: Optional[str] = None) -> Dict[str, Any]:
+                           task_id: Optional[str] = None,
+                           use_proxy: bool = True) -> Dict[str, Any]:
         """Make HTTP request with proxy support
 
         Args:
@@ -372,8 +373,11 @@ class SoraClient:
             add_sentinel_token: Whether to add openai-sentinel-token header (only for generation requests)
             token_id: Token ID for getting token-specific proxy (optional)
             task_id: Task ID for getting task-specific proxy (optional)
+            use_proxy: Whether to use proxy for this request
         """
-        proxy_url = await self.proxy_manager.get_proxy_url(token_id=token_id, task_id=task_id)
+        proxy_url = None
+        if use_proxy:
+            proxy_url = await self.proxy_manager.get_proxy_url(token_id=token_id, task_id=task_id)
 
         headers = {
             "Authorization": f"Bearer {token}",
@@ -514,7 +518,7 @@ class SoraClient:
             data=filename.encode('utf-8')
         )
 
-        result = await self._make_request("POST", "/uploads", token, multipart=mp)
+        result = await self._make_request("POST", "/uploads", token, multipart=mp, use_proxy=False)
         return result["id"]
     
     async def generate_image(self, prompt: str, token: str, width: int = 360,
@@ -838,7 +842,7 @@ class SoraClient:
             data=b"0,3"
         )
 
-        result = await self._make_request("POST", "/characters/upload", token, multipart=mp)
+        result = await self._make_request("POST", "/characters/upload", token, multipart=mp, use_proxy=False)
         return result.get("id")
 
     async def get_cameo_status(self, cameo_id: str, token: str) -> Dict[str, Any]:
@@ -944,7 +948,7 @@ class SoraClient:
             data=b"profile"
         )
 
-        result = await self._make_request("POST", "/project_y/file/upload", token, multipart=mp)
+        result = await self._make_request("POST", "/project_y/file/upload", token, multipart=mp, use_proxy=False)
         return result.get("asset_pointer")
 
     async def delete_character(self, character_id: str, token: str) -> bool:
