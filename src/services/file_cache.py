@@ -117,7 +117,13 @@ class FileCache:
         
         return f"{url_hash}{ext}"
     
-    async def download_and_cache(self, url: str, media_type: str, token_id: Optional[int] = None) -> str:
+    async def download_and_cache(
+        self,
+        url: str,
+        media_type: str,
+        token_id: Optional[int] = None,
+        task_id: Optional[str] = None,
+    ) -> str:
         """
         Download file from URL and cache it locally
 
@@ -125,6 +131,7 @@ class FileCache:
             url: File URL to download
             media_type: 'image' or 'video'
             token_id: Token ID for getting token-specific proxy (optional)
+            task_id: Task ID for getting task-specific proxy (optional)
 
         Returns:
             Local cache filename
@@ -152,7 +159,7 @@ class FileCache:
             # Get proxy if available (token-specific or global)
             proxy_url = None
             if self.proxy_manager:
-                proxy_url = await self.proxy_manager.get_proxy_url(token_id)
+                proxy_url = await self.proxy_manager.get_proxy_url(token_id=token_id, task_id=task_id)
 
             # Download with proxy support
             async with AsyncSession() as session:
@@ -214,4 +221,3 @@ class FileCache:
                 response_text=""
             )
             raise
-

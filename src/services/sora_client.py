@@ -70,6 +70,12 @@ MOBILE_USER_AGENTS = [
     "Sora/1.2026.007 (Android 15; OnePlus 12; build 2600700)",
 ]
 
+class RequestStatusError(Exception):
+    def __init__(self, status_code: int, message: str):
+        super().__init__(message)
+        self.status_code = status_code
+
+
 class SoraClient:
     """Sora API client with proxy support"""
 
@@ -195,16 +201,16 @@ class SoraClient:
 
             resp_text = resp.read().decode("utf-8")
             if resp.status not in (200, 201):
-                raise Exception(f"Request failed: {resp.status} {resp_text}")
+                raise RequestStatusError(resp.status, f"Request failed: {resp.status} {resp_text}")
             return json.loads(resp_text)
         except HTTPError as exc:
             body = exc.read().decode("utf-8", errors="ignore")
-            raise Exception(f"HTTP Error: {exc.code} {body}") from exc
+            raise RequestStatusError(exc.code, f"HTTP Error: {exc.code} {body}") from exc
         except URLError as exc:
             raise Exception(f"URL Error: {exc}") from exc
 
     async def _nf_create_urllib(self, token: str, payload: dict, sentinel_token: str,
-                                proxy_url: Optional[str], token_id: Optional[int] = None) -> Dict[str, Any]:
+                                proxy_url: Optional[str], task_id: Optional[str] = None) -> Dict[str, Any]:
         url = f"{self.base_url}/nf/create"
         user_agent = random.choice(MOBILE_USER_AGENTS)
 
@@ -222,6 +228,15 @@ class SoraClient:
                 self._post_json_sync, url, headers, payload, 30, proxy_url
             )
             return result
+        except RequestStatusError as e:
+            if task_id and (e.status_code in (403, 429) or e.status_code >= 500):
+                self.proxy_manager.rotate_task_proxy(task_id)
+            debug_logger.log_error(
+                error_message=f"nf/create request failed: {str(e)}",
+                status_code=e.status_code,
+                response_text=str(e)
+            )
+            raise
         except Exception as e:
             debug_logger.log_error(
                 error_message=f"nf/create request failed: {str(e)}",
@@ -230,13 +245,13 @@ class SoraClient:
             )
             raise
 
-    async def _generate_sentinel_token(self, token: Optional[str] = None) -> str:
+    async def _generate_sentinel_token(self, token: Optional[str] = None, task_id: Optional[str] = None) -> str:
         """Generate openai-sentinel-token by calling /backend-api/sentinel/req and solving PoW"""
         req_id = str(uuid4())
         user_agent = random.choice(DESKTOP_USER_AGENTS)
         pow_token = self._get_pow_token(user_agent)
 
-        proxy_url = await self.proxy_manager.get_proxy_url()
+        proxy_url = await self.proxy_manager.get_proxy_url(task_id=task_id)
 
         # Request sentinel/req endpoint
         url = f"{self.CHATGPT_BASE_URL}/backend-api/sentinel/req"
@@ -255,6 +270,15 @@ class SoraClient:
             resp = await asyncio.to_thread(
                 self._post_json_sync, url, headers, payload, 10, proxy_url
             )
+        except RequestStatusError as e:
+            if task_id and (e.status_code in (403, 429) or e.status_code >= 500):
+                self.proxy_manager.rotate_task_proxy(task_id)
+            debug_logger.log_error(
+                error_message=f"Sentinel request failed: {str(e)}",
+                status_code=e.status_code,
+                response_text=str(e)
+            )
+            raise
         except Exception as e:
             debug_logger.log_error(
                 error_message=f"Sentinel request failed: {str(e)}",
@@ -335,7 +359,8 @@ class SoraClient:
                            json_data: Optional[Dict] = None,
                            multipart: Optional[Dict] = None,
                            add_sentinel_token: bool = False,
-                           token_id: Optional[int] = None) -> Dict[str, Any]:
+                           token_id: Optional[int] = None,
+                           task_id: Optional[str] = None) -> Dict[str, Any]:
         """Make HTTP request with proxy support
 
         Args:
@@ -346,8 +371,9 @@ class SoraClient:
             multipart: Multipart form data (for file uploads)
             add_sentinel_token: Whether to add openai-sentinel-token header (only for generation requests)
             token_id: Token ID for getting token-specific proxy (optional)
+            task_id: Task ID for getting task-specific proxy (optional)
         """
-        proxy_url = await self.proxy_manager.get_proxy_url(token_id)
+        proxy_url = await self.proxy_manager.get_proxy_url(token_id=token_id, task_id=task_id)
 
         headers = {
             "Authorization": f"Bearer {token}",
@@ -356,7 +382,7 @@ class SoraClient:
 
         # 只在生成请求时添加 sentinel token
         if add_sentinel_token:
-            headers["openai-sentinel-token"] = await self._generate_sentinel_token(token)
+            headers["openai-sentinel-token"] = await self._generate_sentinel_token(token, task_id=task_id)
 
         if not multipart:
             headers["Content-Type"] = "application/json"
@@ -419,6 +445,8 @@ class SoraClient:
 
             # Check status
             if response.status_code not in [200, 201]:
+                if task_id and (response.status_code in (403, 429) or response.status_code >= 500):
+                    self.proxy_manager.rotate_task_proxy(task_id)
                 # Parse error response
                 error_data = None
                 try:
@@ -490,7 +518,8 @@ class SoraClient:
         return result["id"]
     
     async def generate_image(self, prompt: str, token: str, width: int = 360,
-                            height: int = 360, media_id: Optional[str] = None, token_id: Optional[int] = None) -> str:
+                            height: int = 360, media_id: Optional[str] = None, token_id: Optional[int] = None,
+                            task_id: Optional[str] = None) -> str:
         """Generate image (text-to-image or image-to-image)"""
         operation = "remix" if media_id else "simple_compose"
 
@@ -514,12 +543,21 @@ class SoraClient:
         }
 
         # 生成请求需要添加 sentinel token
-        result = await self._make_request("POST", "/video_gen", token, json_data=json_data, add_sentinel_token=True, token_id=token_id)
+        result = await self._make_request(
+            "POST",
+            "/video_gen",
+            token,
+            json_data=json_data,
+            add_sentinel_token=True,
+            token_id=token_id,
+            task_id=task_id,
+        )
         return result["id"]
     
     async def generate_video(self, prompt: str, token: str, orientation: str = "landscape",
                             media_id: Optional[str] = None, n_frames: int = 450, style_id: Optional[str] = None,
-                            model: str = "sy_8", size: str = "small", token_id: Optional[int] = None) -> str:
+                            model: str = "sy_8", size: str = "small", token_id: Optional[int] = None,
+                            task_id: Optional[str] = None) -> str:
         """Generate video (text-to-video or image-to-video)
 
         Args:
@@ -552,26 +590,41 @@ class SoraClient:
         }
 
         # 生成请求需要添加 sentinel token
-        proxy_url = await self.proxy_manager.get_proxy_url(token_id)
-        sentinel_token = await self._generate_sentinel_token(token)
-        result = await self._nf_create_urllib(token, json_data, sentinel_token, proxy_url, token_id)
+        proxy_url = await self.proxy_manager.get_proxy_url(token_id=token_id, task_id=task_id)
+        sentinel_token = await self._generate_sentinel_token(token, task_id=task_id)
+        result = await self._nf_create_urllib(token, json_data, sentinel_token, proxy_url, task_id=task_id)
         return result["id"]
     
-    async def get_image_tasks(self, token: str, limit: int = 20, token_id: Optional[int] = None) -> Dict[str, Any]:
+    async def get_image_tasks(self, token: str, limit: int = 20, token_id: Optional[int] = None,
+                              task_id: Optional[str] = None) -> Dict[str, Any]:
         """Get recent image generation tasks"""
-        return await self._make_request("GET", f"/v2/recent_tasks?limit={limit}", token, token_id=token_id)
+        return await self._make_request(
+            "GET",
+            f"/v2/recent_tasks?limit={limit}",
+            token,
+            token_id=token_id,
+            task_id=task_id,
+        )
 
-    async def get_video_drafts(self, token: str, limit: int = 15, token_id: Optional[int] = None) -> Dict[str, Any]:
+    async def get_video_drafts(self, token: str, limit: int = 15, token_id: Optional[int] = None,
+                               task_id: Optional[str] = None) -> Dict[str, Any]:
         """Get recent video drafts"""
-        return await self._make_request("GET", f"/project_y/profile/drafts?limit={limit}", token, token_id=token_id)
+        return await self._make_request(
+            "GET",
+            f"/project_y/profile/drafts?limit={limit}",
+            token,
+            token_id=token_id,
+            task_id=task_id,
+        )
 
-    async def get_pending_tasks(self, token: str, token_id: Optional[int] = None) -> list:
+    async def get_pending_tasks(self, token: str, token_id: Optional[int] = None,
+                                task_id: Optional[str] = None) -> list:
         """Get pending video generation tasks
 
         Returns:
             List of pending tasks with progress information
         """
-        result = await self._make_request("GET", "/nf/pending/v2", token, token_id=token_id)
+        result = await self._make_request("GET", "/nf/pending/v2", token, token_id=token_id, task_id=task_id)
         # The API returns a list directly
         return result if isinstance(result, list) else []
 
@@ -928,7 +981,8 @@ class SoraClient:
             return True
 
     async def remix_video(self, remix_target_id: str, prompt: str, token: str,
-                         orientation: str = "portrait", n_frames: int = 450, style_id: Optional[str] = None) -> str:
+                         orientation: str = "portrait", n_frames: int = 450, style_id: Optional[str] = None,
+                         task_id: Optional[str] = None) -> str:
         """Generate video using remix (based on existing video)
 
         Args:
@@ -956,13 +1010,14 @@ class SoraClient:
         }
 
         # Generate sentinel token and call /nf/create using urllib
-        proxy_url = await self.proxy_manager.get_proxy_url()
-        sentinel_token = await self._generate_sentinel_token(token)
-        result = await self._nf_create_urllib(token, json_data, sentinel_token, proxy_url)
+        proxy_url = await self.proxy_manager.get_proxy_url(task_id=task_id)
+        sentinel_token = await self._generate_sentinel_token(token, task_id=task_id)
+        result = await self._nf_create_urllib(token, json_data, sentinel_token, proxy_url, task_id=task_id)
         return result.get("id")
 
     async def generate_storyboard(self, prompt: str, token: str, orientation: str = "landscape",
-                                 media_id: Optional[str] = None, n_frames: int = 450, style_id: Optional[str] = None) -> str:
+                                 media_id: Optional[str] = None, n_frames: int = 450, style_id: Optional[str] = None,
+                                 task_id: Optional[str] = None) -> str:
         """Generate video using storyboard mode
 
         Args:
@@ -1003,7 +1058,14 @@ class SoraClient:
             "video_caption": None
         }
 
-        result = await self._make_request("POST", "/nf/create/storyboard", token, json_data=json_data, add_sentinel_token=True)
+        result = await self._make_request(
+            "POST",
+            "/nf/create/storyboard",
+            token,
+            json_data=json_data,
+            add_sentinel_token=True,
+            task_id=task_id,
+        )
         return result.get("id")
 
     async def enhance_prompt(self, prompt: str, token: str, expansion_level: str = "medium",

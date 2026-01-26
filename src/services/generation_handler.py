@@ -7,6 +7,7 @@ import random
 import re
 from typing import Optional, AsyncGenerator, Dict, Any
 from datetime import datetime
+from uuid import uuid4
 from .sora_client import SoraClient
 from .token_manager import TokenManager
 from .load_balancer import LoadBalancer
@@ -213,6 +214,7 @@ class GenerationHandler:
         self.token_manager = token_manager
         self.load_balancer = load_balancer
         self.db = db
+        self.proxy_manager = proxy_manager
         self.concurrency_manager = concurrency_manager
         self.file_cache = FileCache(
             cache_dir="tmp",
@@ -490,6 +492,7 @@ class GenerationHandler:
                 raise Exception(f"Failed to acquire concurrency slot for token {token_obj.id}")
 
         task_id = None
+        task_proxy_key = None
         is_first_chunk = True  # Track if this is the first chunk
         log_id = None  # Initialize log_id
 
@@ -537,6 +540,8 @@ class GenerationHandler:
                         reasoning_content="**Generation Process Begins**\n\nInitializing generation request...\n"
                     )
             
+            task_proxy_key = str(uuid4())
+
             if is_video:
                 # Get n_frames from model configuration
                 n_frames = model_config.get("n_frames", 300)  # Default to 300 frames (10s)
@@ -560,7 +565,8 @@ class GenerationHandler:
                         orientation=model_config["orientation"],
                         media_id=media_id,
                         n_frames=n_frames,
-                        style_id=style_id
+                        style_id=style_id,
+                        task_id=task_proxy_key
                     )
                 else:
                     # Normal video generation
@@ -576,7 +582,8 @@ class GenerationHandler:
                         style_id=style_id,
                         model=sora_model,
                         size=video_size,
-                        token_id=token_obj.id
+                        token_id=token_obj.id,
+                        task_id=task_proxy_key
                     )
             else:
                 task_id = await self.sora_client.generate_image(
@@ -584,8 +591,12 @@ class GenerationHandler:
                     width=model_config["width"],
                     height=model_config["height"],
                     media_id=media_id,
-                    token_id=token_obj.id
+                    token_id=token_obj.id,
+                    task_id=task_proxy_key
                 )
+
+            if self.proxy_manager:
+                self.proxy_manager.bind_task_proxy(task_proxy_key, task_id)
 
             # Save task to database
             task = Task(
@@ -707,6 +718,10 @@ class GenerationHandler:
                         duration=duration
                     )
             raise e
+        finally:
+            if self.proxy_manager:
+                self.proxy_manager.release_task_proxy(task_id)
+                self.proxy_manager.release_task_proxy(task_proxy_key)
     
     async def _poll_task_result(self, task_id: str, token: str, is_video: bool,
                                 stream: bool, prompt: str, token_id: int = None,
@@ -774,7 +789,7 @@ class GenerationHandler:
             try:
                 if is_video:
                     # Get pending tasks to check progress
-                    pending_tasks = await self.sora_client.get_pending_tasks(token, token_id=token_id)
+                    pending_tasks = await self.sora_client.get_pending_tasks(token, token_id=token_id, task_id=task_id)
 
                     # Find matching task in pending tasks
                     task_found = False
@@ -809,7 +824,7 @@ class GenerationHandler:
                     # If task not found in pending tasks, it's completed - fetch from drafts
                     if not task_found:
                         debug_logger.log_info(f"Task {task_id} not found in pending tasks, fetching from drafts...")
-                        result = await self.sora_client.get_video_drafts(token, token_id=token_id)
+                        result = await self.sora_client.get_video_drafts(token, token_id=token_id, task_id=task_id)
                         items = result.get("items", [])
 
                         # Find matching task in drafts
@@ -926,7 +941,12 @@ class GenerationHandler:
                                         # Cache watermark-free video (if cache enabled)
                                         if config.cache_enabled:
                                             try:
-                                                cached_filename = await self.file_cache.download_and_cache(watermark_free_url, "video", token_id=token_id)
+                                                cached_filename = await self.file_cache.download_and_cache(
+                                                    watermark_free_url,
+                                                    "video",
+                                                    token_id=token_id,
+                                                    task_id=task_id,
+                                                )
                                                 local_url = f"{self._get_base_url()}/tmp/{cached_filename}"
                                                 if stream:
                                                     yield self._format_stream_chunk(
@@ -984,7 +1004,12 @@ class GenerationHandler:
                                             raise Exception("Video URL not found")
                                         if config.cache_enabled:
                                             try:
-                                                cached_filename = await self.file_cache.download_and_cache(url, "video", token_id=token_id)
+                                                cached_filename = await self.file_cache.download_and_cache(
+                                                    url,
+                                                    "video",
+                                                    token_id=token_id,
+                                                    task_id=task_id,
+                                                )
                                                 local_url = f"{self._get_base_url()}/tmp/{cached_filename}"
                                             except Exception as cache_error:
                                                 local_url = url
@@ -1002,7 +1027,12 @@ class GenerationHandler:
                                                 )
 
                                             try:
-                                                cached_filename = await self.file_cache.download_and_cache(url, "video", token_id=token_id)
+                                                cached_filename = await self.file_cache.download_and_cache(
+                                                    url,
+                                                    "video",
+                                                    token_id=token_id,
+                                                    task_id=task_id,
+                                                )
                                                 local_url = f"{self._get_base_url()}/tmp/{cached_filename}"
                                                 if stream:
                                                     yield self._format_stream_chunk(
@@ -1038,7 +1068,7 @@ class GenerationHandler:
                                     yield "data: [DONE]\n\n"
                                 return
                 else:
-                    result = await self.sora_client.get_image_tasks(token, token_id=token_id)
+                    result = await self.sora_client.get_image_tasks(token, token_id=token_id, task_id=task_id)
                     task_responses = result.get("task_responses", [])
 
                     # Find matching task
@@ -1068,7 +1098,12 @@ class GenerationHandler:
                                     if config.cache_enabled:
                                         for idx, url in enumerate(urls):
                                             try:
-                                                cached_filename = await self.file_cache.download_and_cache(url, "image", token_id=token_id)
+                                                cached_filename = await self.file_cache.download_and_cache(
+                                                    url,
+                                                    "image",
+                                                    token_id=token_id,
+                                                    task_id=task_id,
+                                                )
                                                 local_url = f"{base_url}/tmp/{cached_filename}"
                                                 local_urls.append(local_url)
                                                 if stream and len(urls) > 1:
@@ -1592,6 +1627,8 @@ class GenerationHandler:
         username = None
         display_name = None
         cameo_id = None
+        task_id = None
+        task_proxy_key = None
         try:
             yield self._format_stream_chunk(
                 reasoning_content="**Character Creation and Video Generation Begins**\n\nInitializing...\n",
@@ -1707,15 +1744,20 @@ class GenerationHandler:
             sora_model = model_config.get("model", "sy_8")
             video_size = model_config.get("size", "small")
 
+            task_proxy_key = str(uuid4())
             task_id = await self.sora_client.generate_video(
                 full_prompt, token_obj.token,
                 orientation=model_config["orientation"],
                 n_frames=n_frames,
                 model=sora_model,
                 size=video_size,
-                token_id=token_obj.id
+                token_id=token_obj.id,
+                task_id=task_proxy_key
             )
             debug_logger.log_info(f"Video generation started, task_id: {task_id}")
+
+            if self.proxy_manager:
+                self.proxy_manager.bind_task_proxy(task_proxy_key, task_id)
 
             # Save task to database
             task = Task(
@@ -1789,6 +1831,9 @@ class GenerationHandler:
             )
             raise
         finally:
+            if self.proxy_manager:
+                self.proxy_manager.release_task_proxy(task_id)
+                self.proxy_manager.release_task_proxy(task_proxy_key)
             # Step 7: Delete character
             if character_id:
                 try:
@@ -1819,6 +1864,7 @@ class GenerationHandler:
             raise Exception("No available tokens for remix generation")
 
         task_id = None
+        task_proxy_key = None
         try:
             yield self._format_stream_chunk(
                 reasoning_content="**Remix Generation Process Begins**\n\nInitializing remix request...\n",
@@ -1838,15 +1884,20 @@ class GenerationHandler:
             yield self._format_stream_chunk(
                 reasoning_content="Sending remix request to server...\n"
             )
+            task_proxy_key = str(uuid4())
             task_id = await self.sora_client.remix_video(
                 remix_target_id=remix_target_id,
                 prompt=clean_prompt,
                 token=token_obj.token,
                 orientation=model_config["orientation"],
                 n_frames=n_frames,
-                style_id=style_id
+                style_id=style_id,
+                task_id=task_proxy_key
             )
             debug_logger.log_info(f"Remix generation started, task_id: {task_id}")
+
+            if self.proxy_manager:
+                self.proxy_manager.bind_task_proxy(task_proxy_key, task_id)
 
             # Save task to database
             task = Task(
@@ -1897,6 +1948,10 @@ class GenerationHandler:
                 response_text=str(e)
             )
             raise
+        finally:
+            if self.proxy_manager:
+                self.proxy_manager.release_task_proxy(task_id)
+                self.proxy_manager.release_task_proxy(task_proxy_key)
 
     async def _poll_cameo_status(self, cameo_id: str, token: str, timeout: int = 600, poll_interval: int = 5) -> Dict[str, Any]:
         """Poll for cameo (character) processing status
