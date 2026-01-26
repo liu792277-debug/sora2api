@@ -21,6 +21,8 @@ class ProxyManager:
     def _replace_sid(proxy_url: str, sid: str) -> str:
         if not proxy_url:
             return proxy_url
+        if re.search(r"\{sid\}", proxy_url, flags=re.IGNORECASE):
+            return re.sub(r"\{sid\}", sid, proxy_url, flags=re.IGNORECASE)
         if re.search(r"sid-", proxy_url, flags=re.IGNORECASE):
             return re.sub(r"(sid-)([^-:@/?]+)", rf"\1{sid}", proxy_url, count=1, flags=re.IGNORECASE)
         if re.search(r"sid=", proxy_url, flags=re.IGNORECASE):
