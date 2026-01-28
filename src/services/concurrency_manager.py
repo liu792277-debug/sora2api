@@ -1,6 +1,10 @@
 """Concurrency manager for token-based rate limiting"""
 import asyncio
-from typing import Dict, Optional
+import random
+import time
+from contextlib import asynccontextmanager
+from typing import Dict, Optional, AsyncIterator
+from ..core.config import config
 from ..core.logger import debug_logger
 
 
@@ -12,6 +16,54 @@ class ConcurrencyManager:
         self._image_concurrency: Dict[int, int] = {}  # token_id -> remaining image concurrency
         self._video_concurrency: Dict[int, int] = {}  # token_id -> remaining video concurrency
         self._lock = asyncio.Lock()  # Protect concurrent access
+        self._request_semaphore = asyncio.Semaphore(self._get_request_concurrency_limit())
+        self._request_start_lock = asyncio.Lock()
+        self._last_request_start: Optional[float] = None
+
+    def _get_request_concurrency_limit(self) -> int:
+        limit = config.request_concurrency_limit
+        return max(1, limit)
+
+    def _get_request_start_delay_range(self) -> tuple[float, float]:
+        minimum = max(0.0, config.request_start_delay_min)
+        maximum = max(minimum, config.request_start_delay_max)
+        return minimum, maximum
+
+    async def acquire_request_slot(self):
+        """Acquire global request slot and enforce randomized start delay."""
+        await self._request_semaphore.acquire()
+        try:
+            await self._enforce_request_start_delay()
+        except Exception:
+            self._request_semaphore.release()
+            raise
+
+    async def release_request_slot(self):
+        """Release global request slot."""
+        self._request_semaphore.release()
+
+    @asynccontextmanager
+    async def request_slot(self) -> AsyncIterator[None]:
+        """Context manager for acquiring/releasing a request slot."""
+        await self.acquire_request_slot()
+        try:
+            yield
+        finally:
+            await self.release_request_slot()
+
+    async def _enforce_request_start_delay(self):
+        minimum, maximum = self._get_request_start_delay_range()
+        if maximum <= 0:
+            return
+        async with self._request_start_lock:
+            now = time.monotonic()
+            if self._last_request_start is not None:
+                delay = random.uniform(minimum, maximum)
+                target_time = self._last_request_start + delay
+                sleep_for = target_time - now
+                if sleep_for > 0:
+                    await asyncio.sleep(sleep_for)
+            self._last_request_start = time.monotonic()
 
     async def initialize(self, tokens: list):
         """
@@ -188,4 +240,3 @@ class ConcurrencyManager:
                 del self._video_concurrency[token_id]
             
             debug_logger.log_info(f"Token {token_id} concurrency reset (image: {image_concurrency}, video: {video_concurrency})")
-
