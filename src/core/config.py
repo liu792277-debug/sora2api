@@ -208,5 +208,20 @@ class Config:
             self._config["token_refresh"] = {}
         self._config["token_refresh"]["at_auto_refresh_enabled"] = enabled
 
+    @property
+    def request_concurrency_limit(self) -> int:
+        """Get global request concurrency limit"""
+        return self._config.get("request_limits", {}).get("concurrency_limit", 1)
+
+    @property
+    def request_start_delay_min(self) -> float:
+        """Get minimum delay between request starts in seconds"""
+        return float(self._config.get("request_limits", {}).get("start_delay_min_seconds", 5))
+
+    @property
+    def request_start_delay_max(self) -> float:
+        """Get maximum delay between request starts in seconds"""
+        return float(self._config.get("request_limits", {}).get("start_delay_max_seconds", 15))
+
 # Global config instance
 config = Config()

@@ -142,15 +142,27 @@ async def create_chat_completion(
             if not request.stream:
                 # Non-streaming mode: only check availability
                 result = None
-                async for chunk in generation_handler.handle_generation(
-                    model=request.model,
-                    prompt=prompt,
-                    image=image_data,
-                    video=video_data,
-                    remix_target_id=remix_target_id,
-                    stream=False
-                ):
-                    result = chunk
+                if generation_handler.concurrency_manager:
+                    async with generation_handler.concurrency_manager.request_slot():
+                        async for chunk in generation_handler.handle_generation(
+                            model=request.model,
+                            prompt=prompt,
+                            image=image_data,
+                            video=video_data,
+                            remix_target_id=remix_target_id,
+                            stream=False
+                        ):
+                            result = chunk
+                else:
+                    async for chunk in generation_handler.handle_generation(
+                        model=request.model,
+                        prompt=prompt,
+                        image=image_data,
+                        video=video_data,
+                        remix_target_id=remix_target_id,
+                        stream=False
+                    ):
+                        result = chunk
 
                 if result:
                     return JSONResponse(content=json.loads(result))
@@ -171,15 +183,27 @@ async def create_chat_completion(
         if request.stream:
             async def generate():
                 try:
-                    async for chunk in generation_handler.handle_generation(
-                        model=request.model,
-                        prompt=prompt,
-                        image=image_data,
-                        video=video_data,
-                        remix_target_id=remix_target_id,
-                        stream=True
-                    ):
-                        yield chunk
+                    if generation_handler.concurrency_manager:
+                        async with generation_handler.concurrency_manager.request_slot():
+                            async for chunk in generation_handler.handle_generation(
+                                model=request.model,
+                                prompt=prompt,
+                                image=image_data,
+                                video=video_data,
+                                remix_target_id=remix_target_id,
+                                stream=True
+                            ):
+                                yield chunk
+                    else:
+                        async for chunk in generation_handler.handle_generation(
+                            model=request.model,
+                            prompt=prompt,
+                            image=image_data,
+                            video=video_data,
+                            remix_target_id=remix_target_id,
+                            stream=True
+                        ):
+                            yield chunk
                 except Exception as e:
                     # Try to parse structured error (JSON format)
                     error_data = None
@@ -205,7 +229,6 @@ async def create_chat_completion(
                     error_chunk = f'data: {json.dumps(error_response)}\n\n'
                     yield error_chunk
                     yield 'data: [DONE]\n\n'
-
             return StreamingResponse(
                 generate(),
                 media_type="text/event-stream",
@@ -218,15 +241,27 @@ async def create_chat_completion(
         else:
             # Non-streaming response (availability check only)
             result = None
-            async for chunk in generation_handler.handle_generation(
-                model=request.model,
-                prompt=prompt,
-                image=image_data,
-                video=video_data,
-                remix_target_id=remix_target_id,
-                stream=False
-            ):
-                result = chunk
+            if generation_handler.concurrency_manager:
+                async with generation_handler.concurrency_manager.request_slot():
+                    async for chunk in generation_handler.handle_generation(
+                        model=request.model,
+                        prompt=prompt,
+                        image=image_data,
+                        video=video_data,
+                        remix_target_id=remix_target_id,
+                        stream=False
+                    ):
+                        result = chunk
+            else:
+                async for chunk in generation_handler.handle_generation(
+                    model=request.model,
+                    prompt=prompt,
+                    image=image_data,
+                    video=video_data,
+                    remix_target_id=remix_target_id,
+                    stream=False
+                ):
+                    result = chunk
 
             if result:
                 return JSONResponse(content=json.loads(result))

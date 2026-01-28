@@ -44,3 +44,8 @@ custom_parse_token = ""
 
 [token_refresh]
 at_auto_refresh_enabled = false
+
+[request_limits]
+concurrency_limit = 1
+start_delay_min_seconds = 5
+start_delay_max_seconds = 15
