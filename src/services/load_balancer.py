@@ -1,6 +1,8 @@
 """Load balancing module"""
 import random
+import asyncio
 from typing import Optional
+from collections import defaultdict
 from ..core.models import Token
 from ..core.config import config
 from .token_manager import TokenManager
@@ -9,13 +11,38 @@ from .concurrency_manager import ConcurrencyManager
 from ..core.logger import debug_logger
 
 class LoadBalancer:
-    """Token load balancer with random selection and image generation lock"""
+    """Token load balancer with random selection and round-robin polling"""
 
     def __init__(self, token_manager: TokenManager, concurrency_manager: Optional[ConcurrencyManager] = None):
         self.token_manager = token_manager
         self.concurrency_manager = concurrency_manager
         # Use image timeout from config as lock timeout
         self.token_lock = TokenLock(lock_timeout=config.image_timeout)
+        # Round-robin state: stores last used token_id for each scenario (image/video/default)
+        # Resets to None on restart
+        self._round_robin_state = {"image": None, "video": None, "default": None}
+        self._rr_lock = asyncio.Lock()
+
+    async def _select_round_robin(self, tokens: list[Token], scenario: str) -> Optional[Token]:
+        """Select tokens in round-robin order for the given scenario"""
+        if not tokens:
+            return None
+        tokens_sorted = sorted(tokens, key=lambda t: t.id)
+
+        async with self._rr_lock:
+            last_id = self._round_robin_state.get(scenario)
+            start_idx = 0
+            if last_id is not None:
+                # Find the position of last used token and move to next
+                for idx, token in enumerate(tokens_sorted):
+                    if token.id == last_id:
+                        start_idx = (idx + 1) % len(tokens_sorted)
+                        break
+            selected = tokens_sorted[start_idx]
+            # Update state for next selection
+            self._round_robin_state[scenario] = selected.id
+
+        return selected
 
     async def select_token(self, for_image_generation: bool = False, for_video_generation: bool = False, require_pro: bool = False) -> Optional[Token]:
         """
@@ -89,6 +116,11 @@ class LoadBalancer:
             if not available_tokens:
                 return None
 
+            # Check if polling mode is enabled
+            if config.call_logic_mode == "polling":
+                scenario = "image"
+                return await self._select_round_robin(available_tokens, scenario)
+
             # Random selection from available tokens
             return random.choice(available_tokens)
         else:
@@ -100,7 +132,18 @@ class LoadBalancer:
                         available_tokens.append(token)
                 if not available_tokens:
                     return None
+
+                # Check if polling mode is enabled
+                if config.call_logic_mode == "polling":
+                    scenario = "video"
+                    return await self._select_round_robin(available_tokens, scenario)
+
                 return random.choice(available_tokens)
             else:
                 # For video generation without concurrency manager, no additional filtering
+                # Check if polling mode is enabled
+                if config.call_logic_mode == "polling":
+                    scenario = "video" if for_video_generation else "default"
+                    return await self._select_round_robin(active_tokens, scenario)
+
                 return random.choice(active_tokens)

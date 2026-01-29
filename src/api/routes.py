@@ -1,13 +1,15 @@
 """API routes - OpenAI compatible endpoints"""
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 from datetime import datetime
 from typing import List
 import json
 import re
+import time
 from ..core.auth import verify_api_key_header
 from ..core.models import ChatCompletionRequest
 from ..services.generation_handler import GenerationHandler, MODEL_CONFIG
+from ..core.logger import debug_logger
 
 router = APIRouter()
 
@@ -71,10 +73,22 @@ async def list_models(api_key: str = Depends(verify_api_key_header)):
 @router.post("/v1/chat/completions")
 async def create_chat_completion(
     request: ChatCompletionRequest,
-    api_key: str = Depends(verify_api_key_header)
+    api_key: str = Depends(verify_api_key_header),
+    http_request: Request = None
 ):
     """Create chat completion (unified endpoint for image and video generation)"""
+    start_time = time.time()
+
     try:
+        # Log client request
+        debug_logger.log_request(
+            method="POST",
+            url="/v1/chat/completions",
+            headers=dict(http_request.headers) if http_request else {},
+            body=request.dict(),
+            source="Client"
+        )
+
         # Extract prompt from messages
         if not request.messages:
             raise HTTPException(status_code=400, detail="Messages cannot be empty")
@@ -142,7 +156,7 @@ async def create_chat_completion(
             if not request.stream:
                 # Non-streaming mode: only check availability
                 result = None
-                async for chunk in generation_handler.handle_generation(
+                async for chunk in generation_handler.handle_generation_with_retry(
                     model=request.model,
                     prompt=prompt,
                     image=image_data,
@@ -153,25 +167,43 @@ async def create_chat_completion(
                     result = chunk
 
                 if result:
-                    return JSONResponse(content=json.loads(result))
+                    duration_ms = (time.time() - start_time) * 1000
+                    response_data = json.loads(result)
+                    debug_logger.log_response(
+                        status_code=200,
+                        headers={"Content-Type": "application/json"},
+                        body=response_data,
+                        duration_ms=duration_ms,
+                        source="Client"
+                    )
+                    return JSONResponse(content=response_data)
                 else:
+                    duration_ms = (time.time() - start_time) * 1000
+                    error_response = {
+                        "error": {
+                            "message": "Availability check failed",
+                            "type": "server_error",
+                            "param": None,
+                            "code": None
+                        }
+                    }
+                    debug_logger.log_response(
+                        status_code=500,
+                        headers={"Content-Type": "application/json"},
+                        body=error_response,
+                        duration_ms=duration_ms,
+                        source="Client"
+                    )
                     return JSONResponse(
                         status_code=500,
-                        content={
-                            "error": {
-                                "message": "Availability check failed",
-                                "type": "server_error",
-                                "param": None,
-                                "code": None
-                            }
-                        }
+                        content=error_response
                     )
 
         # Handle streaming
         if request.stream:
             async def generate():
                 try:
-                    async for chunk in generation_handler.handle_generation(
+                    async for chunk in generation_handler.handle_generation_with_retry(
                         model=request.model,
                         prompt=prompt,
                         image=image_data,
@@ -218,7 +250,7 @@ async def create_chat_completion(
         else:
             # Non-streaming response (availability check only)
             result = None
-            async for chunk in generation_handler.handle_generation(
+            async for chunk in generation_handler.handle_generation_with_retry(
                 model=request.model,
                 prompt=prompt,
                 image=image_data,
@@ -229,31 +261,64 @@ async def create_chat_completion(
                 result = chunk
 
             if result:
-                return JSONResponse(content=json.loads(result))
+                duration_ms = (time.time() - start_time) * 1000
+                response_data = json.loads(result)
+                debug_logger.log_response(
+                    status_code=200,
+                    headers={"Content-Type": "application/json"},
+                    body=response_data,
+                    duration_ms=duration_ms,
+                    source="Client"
+                )
+                return JSONResponse(content=response_data)
             else:
                 # Return OpenAI-compatible error format
+                duration_ms = (time.time() - start_time) * 1000
+                error_response = {
+                    "error": {
+                        "message": "Availability check failed",
+                        "type": "server_error",
+                        "param": None,
+                        "code": None
+                    }
+                }
+                debug_logger.log_response(
+                    status_code=500,
+                    headers={"Content-Type": "application/json"},
+                    body=error_response,
+                    duration_ms=duration_ms,
+                    source="Client"
+                )
                 return JSONResponse(
                     status_code=500,
-                    content={
-                        "error": {
-                            "message": "Availability check failed",
-                            "type": "server_error",
-                            "param": None,
-                            "code": None
-                        }
-                    }
+                    content=error_response
                 )
 
     except Exception as e:
         # Return OpenAI-compatible error format
+        duration_ms = (time.time() - start_time) * 1000
+        error_response = {
+            "error": {
+                "message": str(e),
+                "type": "server_error",
+                "param": None,
+                "code": None
+            }
+        }
+        debug_logger.log_error(
+            error_message=str(e),
+            status_code=500,
+            response_text=str(e),
+            source="Client"
+        )
+        debug_logger.log_response(
+            status_code=500,
+            headers={"Content-Type": "application/json"},
+            body=error_response,
+            duration_ms=duration_ms,
+            source="Client"
+        )
         return JSONResponse(
             status_code=500,
-            content={
-                "error": {
-                    "message": str(e),
-                    "type": "server_error",
-                    "param": None,
-                    "code": None
-                }
-            }
+            content=error_response
         )

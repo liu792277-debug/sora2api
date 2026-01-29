@@ -11,4 +11,6 @@ services:
       - ./config/setting.toml:/app/config/setting.toml
     environment:
       - PYTHONUNBUFFERED=1
+      - TZ=Asia/Shanghai
+      - TIMEZONE_OFFSET=8
     restart: unless-stopped

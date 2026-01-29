@@ -55,6 +55,9 @@ class Database:
             admin_password = "admin"
             api_key = "han1234"
             error_ban_threshold = 3
+            task_retry_enabled = True
+            task_max_retries = 3
+            auto_disable_on_401 = True
 
             if config_dict:
                 global_config = config_dict.get("global", {})
@@ -64,11 +67,14 @@ class Database:
 
                 admin_config = config_dict.get("admin", {})
                 error_ban_threshold = admin_config.get("error_ban_threshold", 3)
+                task_retry_enabled = admin_config.get("task_retry_enabled", True)
+                task_max_retries = admin_config.get("task_max_retries", 3)
+                auto_disable_on_401 = admin_config.get("auto_disable_on_401", True)
 
             await db.execute("""
-                INSERT INTO admin_config (id, admin_username, admin_password, api_key, error_ban_threshold)
-                VALUES (1, ?, ?, ?, ?)
-            """, (admin_username, admin_password, api_key, error_ban_threshold))
+                INSERT INTO admin_config (id, admin_username, admin_password, api_key, error_ban_threshold, task_retry_enabled, task_max_retries, auto_disable_on_401)
+                VALUES (1, ?, ?, ?, ?, ?, ?, ?)
+            """, (admin_username, admin_password, api_key, error_ban_threshold, task_retry_enabled, task_max_retries, auto_disable_on_401))
 
         # Ensure proxy_config has a row
         cursor = await db.execute("SELECT COUNT(*) FROM proxy_config")
@@ -99,6 +105,7 @@ class Database:
             parse_method = "third_party"
             custom_parse_url = None
             custom_parse_token = None
+            fallback_on_failure = True  # Default to True
 
             if config_dict:
                 watermark_config = config_dict.get("watermark_free", {})
@@ -106,15 +113,16 @@ class Database:
                 parse_method = watermark_config.get("parse_method", "third_party")
                 custom_parse_url = watermark_config.get("custom_parse_url", "")
                 custom_parse_token = watermark_config.get("custom_parse_token", "")
+                fallback_on_failure = watermark_config.get("fallback_on_failure", True)
 
                 # Convert empty strings to None
                 custom_parse_url = custom_parse_url if custom_parse_url else None
                 custom_parse_token = custom_parse_token if custom_parse_token else None
 
             await db.execute("""
-                INSERT INTO watermark_free_config (id, watermark_free_enabled, parse_method, custom_parse_url, custom_parse_token)
-                VALUES (1, ?, ?, ?, ?)
-            """, (watermark_free_enabled, parse_method, custom_parse_url, custom_parse_token))
+                INSERT INTO watermark_free_config (id, watermark_free_enabled, parse_method, custom_parse_url, custom_parse_token, fallback_on_failure)
+                VALUES (1, ?, ?, ?, ?, ?)
+            """, (watermark_free_enabled, parse_method, custom_parse_url, custom_parse_token, fallback_on_failure))
 
         # Ensure cache_config has a row
         cursor = await db.execute("SELECT COUNT(*) FROM cache_config")
@@ -171,6 +179,50 @@ class Database:
                 INSERT INTO token_refresh_config (id, at_auto_refresh_enabled)
                 VALUES (1, ?)
             """, (at_auto_refresh_enabled,))
+
+        # Ensure call_logic_config has a row
+        cursor = await db.execute("SELECT COUNT(*) FROM call_logic_config")
+        count = await cursor.fetchone()
+        if count[0] == 0:
+            # Get call logic config from config_dict if provided, otherwise use defaults
+            call_mode = "default"
+            polling_mode_enabled = False
+
+            if config_dict:
+                call_logic_config = config_dict.get("call_logic", {})
+                call_mode = call_logic_config.get("call_mode", "default")
+                # Normalize call_mode
+                if call_mode not in ("default", "polling"):
+                    # Check legacy polling_mode_enabled field
+                    polling_mode_enabled = call_logic_config.get("polling_mode_enabled", False)
+                    call_mode = "polling" if polling_mode_enabled else "default"
+                else:
+                    polling_mode_enabled = call_mode == "polling"
+
+            await db.execute("""
+                INSERT INTO call_logic_config (id, call_mode, polling_mode_enabled)
+                VALUES (1, ?, ?)
+            """, (call_mode, polling_mode_enabled))
+
+        # Ensure pow_proxy_config has a row
+        cursor = await db.execute("SELECT COUNT(*) FROM pow_proxy_config")
+        count = await cursor.fetchone()
+        if count[0] == 0:
+            # Get POW proxy config from config_dict if provided, otherwise use defaults
+            pow_proxy_enabled = False
+            pow_proxy_url = None
+
+            if config_dict:
+                pow_proxy_config = config_dict.get("pow_proxy", {})
+                pow_proxy_enabled = pow_proxy_config.get("pow_proxy_enabled", False)
+                pow_proxy_url = pow_proxy_config.get("pow_proxy_url", "")
+                # Convert empty string to None
+                pow_proxy_url = pow_proxy_url if pow_proxy_url else None
+
+            await db.execute("""
+                INSERT INTO pow_proxy_config (id, pow_proxy_enabled, pow_proxy_url)
+                VALUES (1, ?, ?)
+            """, (pow_proxy_enabled, pow_proxy_url))
 
 
     async def check_and_migrate_db(self, config_dict: dict = None):
@@ -245,6 +297,7 @@ class Database:
                     ("parse_method", "TEXT DEFAULT 'third_party'"),
                     ("custom_parse_url", "TEXT"),
                     ("custom_parse_token", "TEXT"),
+                    ("fallback_on_failure", "BOOLEAN DEFAULT 1"),
                 ]
 
                 for col_name, col_type in columns_to_add:
@@ -377,6 +430,9 @@ class Database:
                     admin_password TEXT DEFAULT 'admin',
                     api_key TEXT DEFAULT 'han1234',
                     error_ban_threshold INTEGER DEFAULT 3,
+                    task_retry_enabled BOOLEAN DEFAULT 1,
+                    task_max_retries INTEGER DEFAULT 3,
+                    auto_disable_on_401 BOOLEAN DEFAULT 1,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
@@ -400,6 +456,7 @@ class Database:
                     parse_method TEXT DEFAULT 'third_party',
                     custom_parse_url TEXT,
                     custom_parse_token TEXT,
+                    fallback_on_failure BOOLEAN DEFAULT 1,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
@@ -438,6 +495,28 @@ class Database:
                 )
             """)
 
+            # Call logic config table
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS call_logic_config (
+                    id INTEGER PRIMARY KEY DEFAULT 1,
+                    call_mode TEXT DEFAULT 'default',
+                    polling_mode_enabled BOOLEAN DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            # POW proxy config table
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS pow_proxy_config (
+                    id INTEGER PRIMARY KEY DEFAULT 1,
+                    pow_proxy_enabled BOOLEAN DEFAULT 0,
+                    pow_proxy_url TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
             # Create indexes
             await db.execute("CREATE INDEX IF NOT EXISTS idx_task_id ON tasks(task_id)")
             await db.execute("CREATE INDEX IF NOT EXISTS idx_task_status ON tasks(status)")
@@ -452,6 +531,18 @@ class Database:
                 await db.execute("ALTER TABLE token_stats ADD COLUMN today_error_count INTEGER DEFAULT 0")
             if not await self._column_exists(db, "token_stats", "today_date"):
                 await db.execute("ALTER TABLE token_stats ADD COLUMN today_date DATE")
+
+            # Migration: Add retry_count column to tasks table if it doesn't exist
+            if not await self._column_exists(db, "tasks", "retry_count"):
+                await db.execute("ALTER TABLE tasks ADD COLUMN retry_count INTEGER DEFAULT 0")
+
+            # Migration: Add task retry config columns to admin_config table if they don't exist
+            if not await self._column_exists(db, "admin_config", "task_retry_enabled"):
+                await db.execute("ALTER TABLE admin_config ADD COLUMN task_retry_enabled BOOLEAN DEFAULT 1")
+            if not await self._column_exists(db, "admin_config", "task_max_retries"):
+                await db.execute("ALTER TABLE admin_config ADD COLUMN task_max_retries INTEGER DEFAULT 3")
+            if not await self._column_exists(db, "admin_config", "auto_disable_on_401"):
+                await db.execute("ALTER TABLE admin_config ADD COLUMN auto_disable_on_401 BOOLEAN DEFAULT 1")
 
             await db.commit()
 
@@ -977,9 +1068,12 @@ class Database:
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute("""
                 UPDATE admin_config
-                SET admin_username = ?, admin_password = ?, api_key = ?, error_ban_threshold = ?, updated_at = CURRENT_TIMESTAMP
+                SET admin_username = ?, admin_password = ?, api_key = ?, error_ban_threshold = ?,
+                    task_retry_enabled = ?, task_max_retries = ?, auto_disable_on_401 = ?,
+                    updated_at = CURRENT_TIMESTAMP
                 WHERE id = 1
-            """, (config.admin_username, config.admin_password, config.api_key, config.error_ban_threshold))
+            """, (config.admin_username, config.admin_password, config.api_key, config.error_ban_threshold,
+                  config.task_retry_enabled, config.task_max_retries, config.auto_disable_on_401))
             await db.commit()
     
     # Proxy config operations
@@ -1019,10 +1113,11 @@ class Database:
             return WatermarkFreeConfig(watermark_free_enabled=False, parse_method="third_party")
 
     async def update_watermark_free_config(self, enabled: bool, parse_method: str = None,
-                                          custom_parse_url: str = None, custom_parse_token: str = None):
+                                          custom_parse_url: str = None, custom_parse_token: str = None,
+                                          fallback_on_failure: bool = None):
         """Update watermark-free configuration"""
         async with aiosqlite.connect(self.db_path) as db:
-            if parse_method is None and custom_parse_url is None and custom_parse_token is None:
+            if parse_method is None and custom_parse_url is None and custom_parse_token is None and fallback_on_failure is None:
                 # Only update enabled status
                 await db.execute("""
                     UPDATE watermark_free_config
@@ -1034,9 +1129,10 @@ class Database:
                 await db.execute("""
                     UPDATE watermark_free_config
                     SET watermark_free_enabled = ?, parse_method = ?, custom_parse_url = ?,
-                        custom_parse_token = ?, updated_at = CURRENT_TIMESTAMP
+                        custom_parse_token = ?, fallback_on_failure = ?, updated_at = CURRENT_TIMESTAMP
                     WHERE id = 1
-                """, (enabled, parse_method or "third_party", custom_parse_url, custom_parse_token))
+                """, (enabled, parse_method or "third_party", custom_parse_url, custom_parse_token,
+                      fallback_on_failure if fallback_on_failure is not None else True))
             await db.commit()
 
     # Cache config operations
@@ -1139,5 +1235,54 @@ class Database:
                 SET at_auto_refresh_enabled = ?, updated_at = CURRENT_TIMESTAMP
                 WHERE id = 1
             """, (at_auto_refresh_enabled,))
+            await db.commit()
+
+    # Call logic config operations
+    async def get_call_logic_config(self) -> "CallLogicConfig":
+        """Get call logic configuration"""
+        from .models import CallLogicConfig
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT * FROM call_logic_config WHERE id = 1")
+            row = await cursor.fetchone()
+            if row:
+                row_dict = dict(row)
+                if not row_dict.get("call_mode"):
+                    row_dict["call_mode"] = "polling" if row_dict.get("polling_mode_enabled") else "default"
+                return CallLogicConfig(**row_dict)
+            return CallLogicConfig(call_mode="default", polling_mode_enabled=False)
+
+    async def update_call_logic_config(self, call_mode: str):
+        """Update call logic configuration"""
+        normalized = "polling" if call_mode == "polling" else "default"
+        polling_mode_enabled = normalized == "polling"
+        async with aiosqlite.connect(self.db_path) as db:
+            # Use INSERT OR REPLACE to ensure the row exists
+            await db.execute("""
+                INSERT OR REPLACE INTO call_logic_config (id, call_mode, polling_mode_enabled, updated_at)
+                VALUES (1, ?, ?, CURRENT_TIMESTAMP)
+            """, (normalized, polling_mode_enabled))
+            await db.commit()
+
+    # POW proxy config operations
+    async def get_pow_proxy_config(self) -> "PowProxyConfig":
+        """Get POW proxy configuration"""
+        from .models import PowProxyConfig
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT * FROM pow_proxy_config WHERE id = 1")
+            row = await cursor.fetchone()
+            if row:
+                return PowProxyConfig(**dict(row))
+            return PowProxyConfig(pow_proxy_enabled=False, pow_proxy_url=None)
+
+    async def update_pow_proxy_config(self, pow_proxy_enabled: bool, pow_proxy_url: Optional[str] = None):
+        """Update POW proxy configuration"""
+        async with aiosqlite.connect(self.db_path) as db:
+            # Use INSERT OR REPLACE to ensure the row exists
+            await db.execute("""
+                INSERT OR REPLACE INTO pow_proxy_config (id, pow_proxy_enabled, pow_proxy_url, updated_at)
+                VALUES (1, ?, ?, CURRENT_TIMESTAMP)
+            """, (pow_proxy_enabled, pow_proxy_url))
             await db.commit()
 

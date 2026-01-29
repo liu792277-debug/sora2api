@@ -66,6 +66,7 @@ class Task(BaseModel):
     progress: float = 0.0
     result_urls: Optional[str] = None  # JSON array
     error_message: Optional[str] = None
+    retry_count: int = 0  # 当前重试次数
     created_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
 
@@ -89,6 +90,9 @@ class AdminConfig(BaseModel):
     admin_password: str  # Read from database, initialized from setting.toml on first startup
     api_key: str  # Read from database, initialized from setting.toml on first startup
     error_ban_threshold: int = 3
+    task_retry_enabled: bool = True  # 是否启用任务失败重试
+    task_max_retries: int = 3  # 任务最大重试次数
+    auto_disable_on_401: bool = True  # 遇到401错误自动禁用token
     updated_at: Optional[datetime] = None
 
 class ProxyConfig(BaseModel):
@@ -106,6 +110,7 @@ class WatermarkFreeConfig(BaseModel):
     parse_method: str  # Read from database, initialized from setting.toml on first startup
     custom_parse_url: Optional[str] = None  # Read from database, initialized from setting.toml on first startup
     custom_parse_token: Optional[str] = None  # Read from database, initialized from setting.toml on first startup
+    fallback_on_failure: bool = True  # Auto fallback to watermarked video on failure, default True
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -130,6 +135,22 @@ class TokenRefreshConfig(BaseModel):
     """Token refresh configuration"""
     id: int = 1
     at_auto_refresh_enabled: bool  # Read from database, initialized from setting.toml on first startup
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+class CallLogicConfig(BaseModel):
+    """Call logic configuration"""
+    id: int = 1
+    call_mode: str = "default"  # "default" or "polling"
+    polling_mode_enabled: bool = False  # Read from database, initialized from setting.toml on first startup
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+class PowProxyConfig(BaseModel):
+    """POW proxy configuration"""
+    id: int = 1
+    pow_proxy_enabled: bool = False  # Whether to enable POW proxy
+    pow_proxy_url: Optional[str] = None  # POW proxy URL (e.g., http://127.0.0.1:7890)
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 

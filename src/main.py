@@ -139,6 +139,11 @@ async def startup_event():
     token_refresh_config = await db.get_token_refresh_config()
     config.set_at_auto_refresh_enabled(token_refresh_config.at_auto_refresh_enabled)
 
+    # Load call logic configuration from database
+    call_logic_config = await db.get_call_logic_config()
+    config.set_call_logic_mode(call_logic_config.call_mode)
+    print(f"✓ Call logic mode: {call_logic_config.call_mode}")
+
     # Initialize concurrency manager with all tokens
     all_tokens = await db.get_all_tokens()
     await concurrency_manager.initialize(all_tokens)

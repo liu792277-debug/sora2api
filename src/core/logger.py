@@ -68,9 +68,20 @@ class DebugLogger:
         headers: Dict[str, str],
         body: Optional[Any] = None,
         files: Optional[Dict] = None,
-        proxy: Optional[str] = None
+        proxy: Optional[str] = None,
+        source: str = "Server"
     ):
-        """Log API request details to log.txt"""
+        """Log API request details to log.txt
+
+        Args:
+            method: HTTP method
+            url: Request URL
+            headers: Request headers
+            body: Request body
+            files: Files to upload
+            proxy: Proxy URL
+            source: Request source - "Client" for user->sora2api, "Server" for sora2api->Sora
+        """
 
         # Check if debug mode is enabled
         if not config.debug_enabled:
@@ -78,7 +89,7 @@ class DebugLogger:
 
         try:
             self._write_separator()
-            self.logger.info(f"🔵 [REQUEST] {self._format_timestamp()}")
+            self.logger.info(f"🔵 [REQUEST][{source}] {self._format_timestamp()}")
             self._write_separator("-")
 
             # Basic info
@@ -136,9 +147,18 @@ class DebugLogger:
         status_code: int,
         headers: Dict[str, str],
         body: Any,
-        duration_ms: Optional[float] = None
+        duration_ms: Optional[float] = None,
+        source: str = "Server"
     ):
-        """Log API response details to log.txt"""
+        """Log API response details to log.txt
+
+        Args:
+            status_code: HTTP status code
+            headers: Response headers
+            body: Response body
+            duration_ms: Request duration in milliseconds
+            source: Request source - "Client" for user->sora2api, "Server" for sora2api->Sora
+        """
 
         # Check if debug mode is enabled
         if not config.debug_enabled:
@@ -146,7 +166,7 @@ class DebugLogger:
 
         try:
             self._write_separator()
-            self.logger.info(f"🟢 [RESPONSE] {self._format_timestamp()}")
+            self.logger.info(f"🟢 [RESPONSE][{source}] {self._format_timestamp()}")
             self._write_separator("-")
 
             # Status
@@ -192,9 +212,17 @@ class DebugLogger:
         self,
         error_message: str,
         status_code: Optional[int] = None,
-        response_text: Optional[str] = None
+        response_text: Optional[str] = None,
+        source: str = "Server"
     ):
-        """Log API error details to log.txt"""
+        """Log API error details to log.txt
+
+        Args:
+            error_message: Error message
+            status_code: HTTP status code
+            response_text: Response text
+            source: Request source - "Client" for user->sora2api, "Server" for sora2api->Sora
+        """
 
         # Check if debug mode is enabled
         if not config.debug_enabled:
@@ -202,7 +230,7 @@ class DebugLogger:
 
         try:
             self._write_separator()
-            self.logger.info(f"🔴 [ERROR] {self._format_timestamp()}")
+            self.logger.info(f"🔴 [ERROR][{source}] {self._format_timestamp()}")
             self._write_separator("-")
 
             if status_code:

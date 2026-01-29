@@ -31,6 +31,11 @@ video_timeout = 3000
 
 [admin]
 error_ban_threshold = 3
+# 任务失败重试配置
+task_retry_enabled = true
+task_max_retries = 3
+# 401错误自动禁用token
+auto_disable_on_401 = true
 
 [proxy]
 proxy_enabled = false
@@ -41,6 +46,17 @@ watermark_free_enabled = false
 parse_method = "third_party"
 custom_parse_url = ""
 custom_parse_token = ""
+fallback_on_failure = true  # Auto fallback to watermarked video on failure
 
 [token_refresh]
 at_auto_refresh_enabled = false
+
+[call_logic]
+call_mode = "default"
+
+[timezone]
+# 时区偏移小时数，默认为东八区（中国标准时间）
+# 可选值：-12 到 +14 的整数
+# 常用时区：中国/新加坡 +8, 日本/韩国 +9, 印度 +5.5, 伦敦 0, 纽约 -5, 洛杉矶 -8
+timezone_offset = 8
+

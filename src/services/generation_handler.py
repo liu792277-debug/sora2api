@@ -17,6 +17,13 @@ from ..core.models import Task, RequestLog
 from ..core.config import config
 from ..core.logger import debug_logger
 
+# Custom exception to carry token_id information
+class GenerationError(Exception):
+    """Custom exception for generation errors that includes token_id"""
+    def __init__(self, message: str, token_id: Optional[int] = None):
+        super().__init__(message)
+        self.token_id = token_id
+
 # Model configuration
 MODEL_CONFIG = {
     "gpt-image": {
@@ -242,6 +249,26 @@ class GenerationHandler:
             video_str = video_str.split(",", 1)[1]
         return base64.b64decode(video_str)
 
+    def _should_retry_on_error(self, error: Exception) -> bool:
+        """判断错误是否应该触发重试
+
+        Args:
+            error: 捕获的异常
+
+        Returns:
+            True if should retry, False otherwise
+        """
+        error_str = str(error).lower()
+
+        # 排除 CF Shield/429 错误（这些错误重试也会失败）
+        if "cf_shield" in error_str or "cloudflare" in error_str:
+            return False
+        if "429" in error_str or "rate limit" in error_str:
+            return False
+
+        # 其他所有错误都可以重试
+        return True
+
     def _process_character_username(self, username_hint: str) -> str:
         """Process character username from API response
 
@@ -380,7 +407,8 @@ class GenerationHandler:
                                image: Optional[str] = None,
                                video: Optional[str] = None,
                                remix_target_id: Optional[str] = None,
-                               stream: bool = True) -> AsyncGenerator[str, None]:
+                               stream: bool = True,
+                               show_init_message: bool = True) -> AsyncGenerator[str, None]:
         """Handle generation request
 
         Args:
@@ -390,6 +418,7 @@ class GenerationHandler:
             video: Base64 encoded video or video URL
             remix_target_id: Sora share link video ID for remix
             stream: Whether to stream response
+            show_init_message: Whether to show "Generation Process Begins" message
         """
         start_time = time.time()
         log_id = None  # Initialize log_id to avoid reference before assignment
@@ -492,6 +521,7 @@ class GenerationHandler:
         task_id = None
         is_first_chunk = True  # Track if this is the first chunk
         log_id = None  # Initialize log_id
+        log_updated = False  # Track if log has been updated
 
         try:
             # Create initial log entry BEFORE submitting task to upstream
@@ -525,7 +555,7 @@ class GenerationHandler:
                     )
 
             # Generate
-            if stream:
+            if stream and show_init_message:
                 if is_first_chunk:
                     yield self._format_stream_chunk(
                         reasoning_content="**Generation Process Begins**\n\nInitializing generation request...\n",
@@ -651,6 +681,7 @@ class GenerationHandler:
                     status_code=200,
                     duration=duration
                 )
+                log_updated = True  # Mark log as updated
 
         except Exception as e:
             # Release lock for image generation on error
@@ -698,6 +729,7 @@ class GenerationHandler:
                         status_code=status_code,
                         duration=duration
                     )
+                    log_updated = True  # Mark log as updated
                 else:
                     # Generic error
                     await self.db.update_request_log(
@@ -706,8 +738,124 @@ class GenerationHandler:
                         status_code=500,
                         duration=duration
                     )
-            raise e
-    
+                    log_updated = True  # Mark log as updated
+            # Wrap exception with token_id information
+            if token_obj:
+                raise GenerationError(str(e), token_id=token_obj.id)
+            else:
+                raise e
+
+        finally:
+            # Ensure log is updated even if exception handling fails
+            # This prevents logs from being stuck at status_code = -1
+            if log_id and not log_updated:
+                try:
+                    # Log was not updated in try or except blocks, update it now
+                    duration = time.time() - start_time
+                    await self.db.update_request_log(
+                        log_id,
+                        response_body=json.dumps({"error": "Task failed or interrupted during processing"}),
+                        status_code=500,
+                        duration=duration
+                    )
+                    debug_logger.log_info(f"Updated stuck log entry {log_id} from status -1 to 500 in finally block")
+                except Exception as finally_error:
+                    # Don't let finally block errors break the flow
+                    debug_logger.log_error(
+                        error_message=f"Failed to update log in finally block: {str(finally_error)}",
+                        status_code=500,
+                        response_text=str(finally_error)
+                    )
+
+    async def handle_generation_with_retry(self, model: str, prompt: str,
+                                          image: Optional[str] = None,
+                                          video: Optional[str] = None,
+                                          remix_target_id: Optional[str] = None,
+                                          stream: bool = True) -> AsyncGenerator[str, None]:
+        """Handle generation request with automatic retry on failure
+
+        Args:
+            model: Model name
+            prompt: Generation prompt
+            image: Base64 encoded image
+            video: Base64 encoded video or video URL
+            remix_target_id: Sora share link video ID for remix
+            stream: Whether to stream response
+        """
+        # Get admin config for retry settings
+        admin_config = await self.db.get_admin_config()
+        retry_enabled = admin_config.task_retry_enabled
+        max_retries = admin_config.task_max_retries if retry_enabled else 0
+        auto_disable_on_401 = admin_config.auto_disable_on_401
+
+        retry_count = 0
+        last_error = None
+        last_token_id = None  # Track the token that caused the error
+
+        while retry_count <= max_retries:
+            try:
+                # Try generation
+                # Only show init message on first attempt (not on retries)
+                show_init = (retry_count == 0)
+                async for chunk in self.handle_generation(model, prompt, image, video, remix_target_id, stream, show_init_message=show_init):
+                    yield chunk
+                # If successful, return
+                return
+
+            except Exception as e:
+                last_error = e
+                error_str = str(e)
+
+                # Extract token_id from GenerationError if available
+                if isinstance(e, GenerationError) and e.token_id:
+                    last_token_id = e.token_id
+
+                # Check if this is a 401 error
+                is_401_error = "401" in error_str or "unauthorized" in error_str.lower() or "token_invalidated" in error_str.lower()
+
+                # If 401 error and auto-disable is enabled, disable the token
+                if is_401_error and auto_disable_on_401 and last_token_id:
+                    debug_logger.log_info(f"Detected 401 error, auto-disabling token {last_token_id}")
+                    try:
+                        await self.db.update_token_status(last_token_id, False)
+                        if stream:
+                            yield self._format_stream_chunk(
+                                reasoning_content=f"**检测到401错误，已自动禁用Token {last_token_id}**\\n\\n正在使用其他Token重试...\\n\\n"
+                            )
+                    except Exception as disable_error:
+                        debug_logger.log_error(
+                            error_message=f"Failed to disable token {last_token_id}: {str(disable_error)}",
+                            status_code=500,
+                            response_text=str(disable_error)
+                        )
+
+                # Check if we should retry
+                should_retry = (
+                    retry_enabled and
+                    retry_count < max_retries and
+                    self._should_retry_on_error(e)
+                )
+
+                if should_retry:
+                    retry_count += 1
+                    debug_logger.log_info(f"Generation failed, retrying ({retry_count}/{max_retries}): {str(e)}")
+
+                    # Send retry notification to user if streaming
+                    if stream:
+                        yield self._format_stream_chunk(
+                            reasoning_content=f"**生成失败，正在重试**\n\n第 {retry_count} 次重试（共 {max_retries} 次）...\n\n失败原因：{str(e)}\n\n"
+                        )
+
+                    # Small delay before retry
+                    await asyncio.sleep(2)
+                else:
+                    # No more retries, raise the error
+                    raise last_error
+
+        # If we exhausted all retries, raise the last error
+        if last_error:
+            raise last_error
+
     async def _poll_task_result(self, task_id: str, token: str, is_video: bool,
                                 stream: bool, prompt: str, token_id: int = None,
                                 log_id: int = None, start_time: float = None) -> AsyncGenerator[str, None]:
@@ -864,11 +1012,15 @@ class GenerationHandler:
                                 watermark_free_config = await self.db.get_watermark_free_config()
                                 watermark_free_enabled = watermark_free_config.watermark_free_enabled
 
+                                # Initialize variables
+                                local_url = None
+                                watermark_free_failed = False
+
                                 if watermark_free_enabled:
                                     # Watermark-free mode: post video and get watermark-free URL
-                                    debug_logger.log_info(f"Entering watermark-free mode for task {task_id}")
+                                    debug_logger.log_info(f"[Watermark-Free] Entering watermark-free mode for task {task_id}")
                                     generation_id = item.get("id")
-                                    debug_logger.log_info(f"Generation ID: {generation_id}")
+                                    debug_logger.log_info(f"[Watermark-Free] Generation ID: {generation_id}")
                                     if not generation_id:
                                         raise Exception("Generation ID not found in video draft")
 
@@ -968,60 +1120,80 @@ class GenerationHandler:
                                                 )
 
                                     except Exception as publish_error:
-                                        # Fallback to normal mode if publish fails
+                                        # Watermark-free mode failed
+                                        watermark_free_failed = True
+                                        import traceback
+                                        error_traceback = traceback.format_exc()
                                         debug_logger.log_error(
-                                            error_message=f"Watermark-free mode failed: {str(publish_error)}",
+                                            error_message=f"[Watermark-Free] ❌ FAILED - Error: {str(publish_error)}",
                                             status_code=500,
-                                            response_text=str(publish_error)
+                                            response_text=f"{str(publish_error)}\n\nTraceback:\n{error_traceback}"
                                         )
-                                        if stream:
-                                            yield self._format_stream_chunk(
-                                                reasoning_content=f"Warning: Failed to get watermark-free version - {str(publish_error)}\nFalling back to normal video...\n"
-                                            )
-                                        # Use downloadable_url instead of url
-                                        url = item.get("downloadable_url") or item.get("url")
-                                        if not url:
-                                            raise Exception("Video URL not found")
-                                        if config.cache_enabled:
-                                            try:
-                                                cached_filename = await self.file_cache.download_and_cache(url, "video", token_id=token_id)
-                                                local_url = f"{self._get_base_url()}/tmp/{cached_filename}"
-                                            except Exception as cache_error:
-                                                local_url = url
-                                        else:
-                                            local_url = url
-                                else:
-                                    # Normal mode: use downloadable_url instead of url
-                                    url = item.get("downloadable_url") or item.get("url")
-                                    if url:
-                                        # Cache video file (if cache enabled)
-                                        if config.cache_enabled:
+
+                                        # Check if fallback is enabled
+                                        if watermark_config.fallback_on_failure:
+                                            debug_logger.log_info(f"[Watermark-Free] Fallback enabled, falling back to normal mode (original URL)")
                                             if stream:
                                                 yield self._format_stream_chunk(
-                                                    reasoning_content="**Video Generation Completed**\n\nVideo generation successful. Now caching the video file...\n"
+                                                    reasoning_content=f"⚠️ Warning: Failed to get watermark-free version - {str(publish_error)}\nFalling back to normal video...\n"
                                                 )
+                                        else:
+                                            # Fallback disabled, mark task as failed
+                                            debug_logger.log_error(
+                                                error_message=f"[Watermark-Free] Fallback disabled, marking task as failed",
+                                                status_code=500,
+                                                response_text=str(publish_error)
+                                            )
+                                            if stream:
+                                                yield self._format_stream_chunk(
+                                                    reasoning_content=f"❌ Error: Failed to get watermark-free version - {str(publish_error)}\nFallback is disabled. Task marked as failed.\n"
+                                                )
+                                            # Re-raise the exception to mark task as failed
+                                            raise
 
-                                            try:
-                                                cached_filename = await self.file_cache.download_and_cache(url, "video", token_id=token_id)
-                                                local_url = f"{self._get_base_url()}/tmp/{cached_filename}"
-                                                if stream:
+                                # If watermark-free mode is disabled or failed (with fallback enabled), use normal mode
+                                if not watermark_free_enabled or (watermark_free_failed and watermark_config.fallback_on_failure):
+                                    # Normal mode: use downloadable_url instead of url
+                                    url = item.get("downloadable_url") or item.get("url")
+                                    if not url:
+                                        raise Exception("Video URL not found in draft")
+
+                                    debug_logger.log_info(f"Using original URL from draft: {url[:100]}...")
+
+                                    if config.cache_enabled:
+                                        # Show appropriate message based on mode
+                                        if stream and not watermark_free_failed:
+                                            # Normal mode (watermark-free disabled)
+                                            yield self._format_stream_chunk(
+                                                reasoning_content="**Video Generation Completed**\n\nVideo generation successful. Now caching the video file...\n"
+                                            )
+
+                                        try:
+                                            cached_filename = await self.file_cache.download_and_cache(url, "video", token_id=token_id)
+                                            local_url = f"{self._get_base_url()}/tmp/{cached_filename}"
+                                            if stream:
+                                                if watermark_free_failed:
+                                                    yield self._format_stream_chunk(
+                                                        reasoning_content="Video file cached successfully (fallback mode). Preparing final response...\n"
+                                                    )
+                                                else:
                                                     yield self._format_stream_chunk(
                                                         reasoning_content="Video file cached successfully. Preparing final response...\n"
                                                     )
-                                            except Exception as cache_error:
-                                                # Fallback to original URL if caching fails
-                                                local_url = url
-                                                if stream:
-                                                    yield self._format_stream_chunk(
-                                                        reasoning_content=f"Warning: Failed to cache file - {str(cache_error)}\nUsing original URL instead...\n"
-                                                    )
-                                        else:
-                                            # Cache disabled: use original URL directly
+                                        except Exception as cache_error:
                                             local_url = url
                                             if stream:
                                                 yield self._format_stream_chunk(
-                                                    reasoning_content="**Video Generation Completed**\n\nCache is disabled. Using original URL directly...\n"
+                                                    reasoning_content=f"Warning: Failed to cache file - {str(cache_error)}\nUsing original URL instead...\n"
                                                 )
+                                    else:
+                                        # Cache disabled
+                                        local_url = url
+                                        if stream and not watermark_free_failed:
+                                            # Normal mode (watermark-free disabled)
+                                            yield self._format_stream_chunk(
+                                                reasoning_content="**Video Generation Completed**\n\nCache is disabled. Using original URL directly...\n"
+                                            )
 
                                 # Task completed
                                 await self.db.update_task(
