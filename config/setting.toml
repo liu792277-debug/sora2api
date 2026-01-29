@@ -7,7 +7,9 @@ admin_password = "admin"
 base_url = "https://sora.chatgpt.com/backend"
 timeout = 120
 max_retries = 3
-poll_interval = 2.5
+poll_interval = 10
+poll_interval_min_seconds = 10
+poll_interval_max_seconds = 15
 max_poll_attempts = 600
 
 [server]
@@ -47,5 +49,5 @@ at_auto_refresh_enabled = false
 
 [request_limits]
 concurrency_limit = 1
-start_delay_min_seconds = 5
-start_delay_max_seconds = 15
+start_delay_min_seconds = 8
+start_delay_max_seconds = 13

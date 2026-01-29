@@ -57,12 +57,14 @@ class ConcurrencyManager:
             return
         async with self._request_start_lock:
             now = time.monotonic()
-            if self._last_request_start is not None:
-                delay = random.uniform(minimum, maximum)
+            delay = random.uniform(minimum, maximum)
+            if self._last_request_start is None:
+                target_time = now + delay
+            else:
                 target_time = self._last_request_start + delay
-                sleep_for = target_time - now
-                if sleep_for > 0:
-                    await asyncio.sleep(sleep_for)
+            sleep_for = target_time - now
+            if sleep_for > 0:
+                await asyncio.sleep(sleep_for)
             self._last_request_start = time.monotonic()
 
     async def initialize(self, tokens: list):

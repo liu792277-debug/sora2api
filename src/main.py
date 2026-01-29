@@ -42,11 +42,11 @@ app.add_middleware(
 
 # Initialize components
 db = Database()
-token_manager = TokenManager(db)
-proxy_manager = ProxyManager(db)
 concurrency_manager = ConcurrencyManager()
+token_manager = TokenManager(db, concurrency_manager)
+proxy_manager = ProxyManager(db)
 load_balancer = LoadBalancer(token_manager, concurrency_manager)
-sora_client = SoraClient(proxy_manager)
+sora_client = SoraClient(proxy_manager, concurrency_manager)
 generation_handler = GenerationHandler(sora_client, token_manager, load_balancer, db, proxy_manager, concurrency_manager)
 
 # Set dependencies for route modules

@@ -8,14 +8,16 @@ import time
 import random
 import string
 import re
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, AsyncIterator
 from uuid import uuid4
 from urllib.request import Request, urlopen, build_opener, ProxyHandler
 from urllib.error import HTTPError, URLError
 from curl_cffi.requests import AsyncSession
 from curl_cffi import CurlMime
 from .proxy_manager import ProxyManager
+from .concurrency_manager import ConcurrencyManager
 from ..core.config import config
 from ..core.logger import debug_logger
 
@@ -76,10 +78,22 @@ class SoraClient:
     CHATGPT_BASE_URL = "https://chatgpt.com"
     SENTINEL_FLOW = "sora_2_create_task"
 
-    def __init__(self, proxy_manager: ProxyManager):
+    def __init__(self, proxy_manager: ProxyManager, concurrency_manager: Optional[ConcurrencyManager] = None):
         self.proxy_manager = proxy_manager
         self.base_url = config.sora_base_url
         self.timeout = config.sora_timeout
+        self.concurrency_manager = concurrency_manager
+
+    @asynccontextmanager
+    async def _request_slot(self, apply_delay: bool = True) -> AsyncIterator[None]:
+        if apply_delay and self.concurrency_manager:
+            await self.concurrency_manager.acquire_request_slot()
+            try:
+                yield
+            finally:
+                await self.concurrency_manager.release_request_slot()
+        else:
+            yield
 
     @staticmethod
     def _get_pow_parse_time() -> str:
@@ -218,10 +232,11 @@ class SoraClient:
         }
 
         try:
-            result = await asyncio.to_thread(
-                self._post_json_sync, url, headers, payload, 30, proxy_url
-            )
-            return result
+            async with self._request_slot():
+                result = await asyncio.to_thread(
+                    self._post_json_sync, url, headers, payload, 30, proxy_url
+                )
+                return result
         except Exception as e:
             debug_logger.log_error(
                 error_message=f"nf/create request failed: {str(e)}",
@@ -252,9 +267,10 @@ class SoraClient:
             headers["Authorization"] = f"Bearer {token}"
 
         try:
-            resp = await asyncio.to_thread(
-                self._post_json_sync, url, headers, payload, 10, proxy_url
-            )
+            async with self._request_slot():
+                resp = await asyncio.to_thread(
+                    self._post_json_sync, url, headers, payload, 10, proxy_url
+                )
         except Exception as e:
             debug_logger.log_error(
                 error_message=f"Sentinel request failed: {str(e)}",
@@ -335,7 +351,8 @@ class SoraClient:
                            json_data: Optional[Dict] = None,
                            multipart: Optional[Dict] = None,
                            add_sentinel_token: bool = False,
-                           token_id: Optional[int] = None) -> Dict[str, Any]:
+                           token_id: Optional[int] = None,
+                           apply_delay: bool = True) -> Dict[str, Any]:
         """Make HTTP request with proxy support
 
         Args:
@@ -361,96 +378,96 @@ class SoraClient:
         if not multipart:
             headers["Content-Type"] = "application/json"
 
-        async with AsyncSession() as session:
-            url = f"{self.base_url}{endpoint}"
+        async with self._request_slot(apply_delay):
+            async with AsyncSession() as session:
+                url = f"{self.base_url}{endpoint}"
+                kwargs = {
+                    "headers": headers,
+                    "timeout": self.timeout,
+                    "impersonate": "chrome"  # 自动生成 User-Agent 和浏览器指纹
+                }
 
-            kwargs = {
-                "headers": headers,
-                "timeout": self.timeout,
-                "impersonate": "chrome"  # 自动生成 User-Agent 和浏览器指纹
-            }
+                if proxy_url:
+                    kwargs["proxy"] = proxy_url
 
-            if proxy_url:
-                kwargs["proxy"] = proxy_url
+                if json_data:
+                    kwargs["json"] = json_data
 
-            if json_data:
-                kwargs["json"] = json_data
+                if multipart:
+                    kwargs["multipart"] = multipart
 
-            if multipart:
-                kwargs["multipart"] = multipart
-
-            # Log request
-            debug_logger.log_request(
-                method=method,
-                url=url,
-                headers=headers,
-                body=json_data,
-                files=multipart,
-                proxy=proxy_url
-            )
-
-            # Record start time
-            start_time = time.time()
-
-            # Make request
-            if method == "GET":
-                response = await session.get(url, **kwargs)
-            elif method == "POST":
-                response = await session.post(url, **kwargs)
-            else:
-                raise ValueError(f"Unsupported method: {method}")
-
-            # Calculate duration
-            duration_ms = (time.time() - start_time) * 1000
-
-            # Parse response
-            try:
-                response_json = response.json()
-            except:
-                response_json = None
-
-            # Log response
-            debug_logger.log_response(
-                status_code=response.status_code,
-                headers=dict(response.headers),
-                body=response_json if response_json else response.text,
-                duration_ms=duration_ms
-            )
-
-            # Check status
-            if response.status_code not in [200, 201]:
-                # Parse error response
-                error_data = None
-                try:
-                    error_data = response.json()
-                except:
-                    pass
-
-                # Check for unsupported_country_code error
-                if error_data and isinstance(error_data, dict):
-                    error_info = error_data.get("error", {})
-                    if error_info.get("code") == "unsupported_country_code":
-                        # Create structured error with full error data
-                        import json
-                        error_msg = json.dumps(error_data)
-                        debug_logger.log_error(
-                            error_message=f"Unsupported country: {error_msg}",
-                            status_code=response.status_code,
-                            response_text=error_msg
-                        )
-                        # Raise exception with structured error data
-                        raise Exception(error_msg)
-
-                # Generic error handling
-                error_msg = f"API request failed: {response.status_code} - {response.text}"
-                debug_logger.log_error(
-                    error_message=error_msg,
-                    status_code=response.status_code,
-                    response_text=response.text
+                # Log request
+                debug_logger.log_request(
+                    method=method,
+                    url=url,
+                    headers=headers,
+                    body=json_data,
+                    files=multipart,
+                    proxy=proxy_url
                 )
-                raise Exception(error_msg)
 
-            return response_json if response_json else response.json()
+                # Record start time
+                start_time = time.time()
+
+                # Make request
+                if method == "GET":
+                    response = await session.get(url, **kwargs)
+                elif method == "POST":
+                    response = await session.post(url, **kwargs)
+                else:
+                    raise ValueError(f"Unsupported method: {method}")
+
+                # Calculate duration
+                duration_ms = (time.time() - start_time) * 1000
+
+                # Parse response
+                try:
+                    response_json = response.json()
+                except:
+                    response_json = None
+
+                # Log response
+                debug_logger.log_response(
+                    status_code=response.status_code,
+                    headers=dict(response.headers),
+                    body=response_json if response_json else response.text,
+                    duration_ms=duration_ms
+                )
+
+                # Check status
+                if response.status_code not in [200, 201]:
+                    # Parse error response
+                    error_data = None
+                    try:
+                        error_data = response.json()
+                    except:
+                        pass
+
+                    # Check for unsupported_country_code error
+                    if error_data and isinstance(error_data, dict):
+                        error_info = error_data.get("error", {})
+                        if error_info.get("code") == "unsupported_country_code":
+                            # Create structured error with full error data
+                            import json
+                            error_msg = json.dumps(error_data)
+                            debug_logger.log_error(
+                                error_message=f"Unsupported country: {error_msg}",
+                                status_code=response.status_code,
+                                response_text=error_msg
+                            )
+                            # Raise exception with structured error data
+                            raise Exception(error_msg)
+
+                    # Generic error handling
+                    error_msg = f"API request failed: {response.status_code} - {response.text}"
+                    debug_logger.log_error(
+                        error_message=error_msg,
+                        status_code=response.status_code,
+                        response_text=response.text
+                    )
+                    raise Exception(error_msg)
+
+                return response_json if response_json else response.json()
     
     async def get_user_info(self, token: str) -> Dict[str, Any]:
         """Get user information"""
@@ -557,21 +574,21 @@ class SoraClient:
         result = await self._nf_create_urllib(token, json_data, sentinel_token, proxy_url, token_id)
         return result["id"]
     
-    async def get_image_tasks(self, token: str, limit: int = 20, token_id: Optional[int] = None) -> Dict[str, Any]:
+    async def get_image_tasks(self, token: str, limit: int = 20, token_id: Optional[int] = None, apply_delay: bool = True) -> Dict[str, Any]:
         """Get recent image generation tasks"""
-        return await self._make_request("GET", f"/v2/recent_tasks?limit={limit}", token, token_id=token_id)
+        return await self._make_request("GET", f"/v2/recent_tasks?limit={limit}", token, token_id=token_id, apply_delay=apply_delay)
 
-    async def get_video_drafts(self, token: str, limit: int = 15, token_id: Optional[int] = None) -> Dict[str, Any]:
+    async def get_video_drafts(self, token: str, limit: int = 15, token_id: Optional[int] = None, apply_delay: bool = True) -> Dict[str, Any]:
         """Get recent video drafts"""
-        return await self._make_request("GET", f"/project_y/profile/drafts?limit={limit}", token, token_id=token_id)
+        return await self._make_request("GET", f"/project_y/profile/drafts?limit={limit}", token, token_id=token_id, apply_delay=apply_delay)
 
-    async def get_pending_tasks(self, token: str, token_id: Optional[int] = None) -> list:
+    async def get_pending_tasks(self, token: str, token_id: Optional[int] = None, apply_delay: bool = True) -> list:
         """Get pending video generation tasks
 
         Returns:
             List of pending tasks with progress information
         """
-        result = await self._make_request("GET", "/nf/pending/v2", token, token_id=token_id)
+        result = await self._make_request("GET", "/nf/pending/v2", token, token_id=token_id, apply_delay=apply_delay)
         # The API returns a list directly
         return result if isinstance(result, list) else []
 
@@ -618,56 +635,57 @@ class SoraClient:
             "Authorization": f"Bearer {token}"
         }
 
-        async with AsyncSession() as session:
-            url = f"{self.base_url}/project_y/post/{post_id}"
+        async with self._request_slot():
+            async with AsyncSession() as session:
+                url = f"{self.base_url}/project_y/post/{post_id}"
 
-            kwargs = {
-                "headers": headers,
-                "timeout": self.timeout,
-                "impersonate": "chrome"
-            }
+                kwargs = {
+                    "headers": headers,
+                    "timeout": self.timeout,
+                    "impersonate": "chrome"
+                }
 
-            if proxy_url:
-                kwargs["proxy"] = proxy_url
+                if proxy_url:
+                    kwargs["proxy"] = proxy_url
 
-            # Log request
-            debug_logger.log_request(
-                method="DELETE",
-                url=url,
-                headers=headers,
-                body=None,
-                files=None,
-                proxy=proxy_url
-            )
-
-            # Record start time
-            start_time = time.time()
-
-            # Make DELETE request
-            response = await session.delete(url, **kwargs)
-
-            # Calculate duration
-            duration_ms = (time.time() - start_time) * 1000
-
-            # Log response
-            debug_logger.log_response(
-                status_code=response.status_code,
-                headers=dict(response.headers),
-                body=response.text if response.text else "No content",
-                duration_ms=duration_ms
-            )
-
-            # Check status (DELETE typically returns 204 No Content or 200 OK)
-            if response.status_code not in [200, 204]:
-                error_msg = f"Delete post failed: {response.status_code} - {response.text}"
-                debug_logger.log_error(
-                    error_message=error_msg,
-                    status_code=response.status_code,
-                    response_text=response.text
+                # Log request
+                debug_logger.log_request(
+                    method="DELETE",
+                    url=url,
+                    headers=headers,
+                    body=None,
+                    files=None,
+                    proxy=proxy_url
                 )
-                raise Exception(error_msg)
 
-            return True
+                # Record start time
+                start_time = time.time()
+
+                # Make DELETE request
+                response = await session.delete(url, **kwargs)
+
+                # Calculate duration
+                duration_ms = (time.time() - start_time) * 1000
+
+                # Log response
+                debug_logger.log_response(
+                    status_code=response.status_code,
+                    headers=dict(response.headers),
+                    body=response.text if response.text else "No content",
+                    duration_ms=duration_ms
+                )
+
+                # Check status (DELETE typically returns 204 No Content or 200 OK)
+                if response.status_code not in [200, 204]:
+                    error_msg = f"Delete post failed: {response.status_code} - {response.text}"
+                    debug_logger.log_error(
+                        error_message=error_msg,
+                        status_code=response.status_code,
+                        response_text=response.text
+                    )
+                    raise Exception(error_msg)
+
+                return True
 
     async def get_watermark_free_url_custom(self, parse_url: str, parse_token: str, post_id: str) -> str:
         """Get watermark-free video URL from custom parse server
@@ -704,54 +722,55 @@ class SoraClient:
             kwargs["proxy"] = proxy_url
 
         try:
-            async with AsyncSession() as session:
-                # Record start time
-                start_time = time.time()
+            async with self._request_slot():
+                async with AsyncSession() as session:
+                    # Record start time
+                    start_time = time.time()
 
-                # Make POST request to custom parse server
-                response = await session.post(f"{parse_url}/get-sora-link", **kwargs)
+                    # Make POST request to custom parse server
+                    response = await session.post(f"{parse_url}/get-sora-link", **kwargs)
 
-                # Calculate duration
-                duration_ms = (time.time() - start_time) * 1000
+                    # Calculate duration
+                    duration_ms = (time.time() - start_time) * 1000
 
-                # Log response
-                debug_logger.log_response(
-                    status_code=response.status_code,
-                    headers=dict(response.headers),
-                    body=response.text if response.text else "No content",
-                    duration_ms=duration_ms
-                )
-
-                # Check status
-                if response.status_code != 200:
-                    error_msg = f"Custom parse failed: {response.status_code} - {response.text}"
-                    debug_logger.log_error(
-                        error_message=error_msg,
+                    # Log response
+                    debug_logger.log_response(
                         status_code=response.status_code,
-                        response_text=response.text
+                        headers=dict(response.headers),
+                        body=response.text if response.text else "No content",
+                        duration_ms=duration_ms
                     )
-                    raise Exception(error_msg)
 
-                # Parse response
-                result = response.json()
+                    # Check status
+                    if response.status_code != 200:
+                        error_msg = f"Custom parse failed: {response.status_code} - {response.text}"
+                        debug_logger.log_error(
+                            error_message=error_msg,
+                            status_code=response.status_code,
+                            response_text=response.text
+                        )
+                        raise Exception(error_msg)
 
-                # Check for error in response
-                if "error" in result:
-                    error_msg = f"Custom parse error: {result['error']}"
-                    debug_logger.log_error(
-                        error_message=error_msg,
-                        status_code=401,
-                        response_text=str(result)
-                    )
-                    raise Exception(error_msg)
+                    # Parse response
+                    result = response.json()
 
-                # Extract download link
-                download_link = result.get("download_link")
-                if not download_link:
-                    raise Exception("No download_link in custom parse response")
+                    # Check for error in response
+                    if "error" in result:
+                        error_msg = f"Custom parse error: {result['error']}"
+                        debug_logger.log_error(
+                            error_message=error_msg,
+                            status_code=401,
+                            response_text=str(result)
+                        )
+                        raise Exception(error_msg)
 
-                debug_logger.log_info(f"Custom parse successful: {download_link}")
-                return download_link
+                    # Extract download link
+                    download_link = result.get("download_link")
+                    if not download_link:
+                        raise Exception("No download_link in custom parse response")
+
+                    debug_logger.log_info(f"Custom parse successful: {download_link}")
+                    return download_link
 
         except Exception as e:
             debug_logger.log_error(
@@ -788,7 +807,7 @@ class SoraClient:
         result = await self._make_request("POST", "/characters/upload", token, multipart=mp)
         return result.get("id")
 
-    async def get_cameo_status(self, cameo_id: str, token: str) -> Dict[str, Any]:
+    async def get_cameo_status(self, cameo_id: str, token: str, apply_delay: bool = True) -> Dict[str, Any]:
         """Get character (cameo) processing status
 
         Args:
@@ -798,7 +817,7 @@ class SoraClient:
         Returns:
             Dictionary with status, display_name_hint, username_hint, profile_asset_url, instruction_set_hint
         """
-        return await self._make_request("GET", f"/project_y/cameos/in_progress/{cameo_id}", token)
+        return await self._make_request("GET", f"/project_y/cameos/in_progress/{cameo_id}", token, apply_delay=apply_delay)
 
     async def download_character_image(self, image_url: str) -> bytes:
         """Download character image from URL
@@ -819,11 +838,12 @@ class SoraClient:
         if proxy_url:
             kwargs["proxy"] = proxy_url
 
-        async with AsyncSession() as session:
-            response = await session.get(image_url, **kwargs)
-            if response.status_code != 200:
-                raise Exception(f"Failed to download image: {response.status_code}")
-            return response.content
+        async with self._request_slot():
+            async with AsyncSession() as session:
+                response = await session.get(image_url, **kwargs)
+                if response.status_code != 200:
+                    raise Exception(f"Failed to download image: {response.status_code}")
+                return response.content
 
     async def finalize_character(self, cameo_id: str, username: str, display_name: str,
                                 profile_asset_pointer: str, instruction_set, token: str) -> str:
@@ -910,22 +930,23 @@ class SoraClient:
             "Authorization": f"Bearer {token}"
         }
 
-        async with AsyncSession() as session:
-            url = f"{self.base_url}/project_y/characters/{character_id}"
+        async with self._request_slot():
+            async with AsyncSession() as session:
+                url = f"{self.base_url}/project_y/characters/{character_id}"
 
-            kwargs = {
-                "headers": headers,
-                "timeout": self.timeout,
-                "impersonate": "chrome"
-            }
+                kwargs = {
+                    "headers": headers,
+                    "timeout": self.timeout,
+                    "impersonate": "chrome"
+                }
 
-            if proxy_url:
-                kwargs["proxy"] = proxy_url
+                if proxy_url:
+                    kwargs["proxy"] = proxy_url
 
-            response = await session.delete(url, **kwargs)
-            if response.status_code not in [200, 204]:
-                raise Exception(f"Failed to delete character: {response.status_code}")
-            return True
+                response = await session.delete(url, **kwargs)
+                if response.status_code not in [200, 204]:
+                    raise Exception(f"Failed to delete character: {response.status_code}")
+                return True
 
     async def remix_video(self, remix_target_id: str, prompt: str, token: str,
                          orientation: str = "portrait", n_frames: int = 450, style_id: Optional[str] = None) -> str:

@@ -714,8 +714,10 @@ class GenerationHandler:
         """Poll for task result with timeout"""
         # Get timeout from config
         timeout = config.video_timeout if is_video else config.image_timeout
-        poll_interval = config.poll_interval
-        max_attempts = int(timeout / poll_interval)  # Calculate max attempts based on timeout
+        poll_min = config.poll_interval_min
+        poll_max = config.poll_interval_max
+        base_interval = poll_min if poll_min > 0 else 1
+        max_attempts = int(timeout / base_interval)  # Calculate max attempts based on timeout
         last_progress = 0
         start_time = time.time()
         last_heartbeat_time = start_time  # Track last heartbeat for image generation
@@ -769,12 +771,13 @@ class GenerationHandler:
                 raise Exception(f"Upstream API timeout: Generation exceeded {timeout} seconds limit")
 
 
+            poll_interval = random.uniform(poll_min, poll_max)
             await asyncio.sleep(poll_interval)
 
             try:
                 if is_video:
                     # Get pending tasks to check progress
-                    pending_tasks = await self.sora_client.get_pending_tasks(token, token_id=token_id)
+                    pending_tasks = await self.sora_client.get_pending_tasks(token, token_id=token_id, apply_delay=False)
 
                     # Find matching task in pending tasks
                     task_found = False
@@ -809,7 +812,7 @@ class GenerationHandler:
                     # If task not found in pending tasks, it's completed - fetch from drafts
                     if not task_found:
                         debug_logger.log_info(f"Task {task_id} not found in pending tasks, fetching from drafts...")
-                        result = await self.sora_client.get_video_drafts(token, token_id=token_id)
+                        result = await self.sora_client.get_video_drafts(token, token_id=token_id, apply_delay=False)
                         items = result.get("items", [])
 
                         # Find matching task in drafts
@@ -1038,7 +1041,7 @@ class GenerationHandler:
                                     yield "data: [DONE]\n\n"
                                 return
                 else:
-                    result = await self.sora_client.get_image_tasks(token, token_id=token_id)
+                    result = await self.sora_client.get_image_tasks(token, token_id=token_id, apply_delay=False)
                     task_responses = result.get("task_responses", [])
 
                     # Find matching task
@@ -1911,7 +1914,10 @@ class GenerationHandler:
             Cameo status dictionary with display_name_hint, username_hint, profile_asset_url, instruction_set_hint
         """
         start_time = time.time()
-        max_attempts = int(timeout / poll_interval)
+        poll_min = config.poll_interval_min
+        poll_max = config.poll_interval_max
+        base_interval = poll_min if poll_min > 0 else poll_interval
+        max_attempts = int(timeout / base_interval)
         consecutive_errors = 0
         max_consecutive_errors = 3  # Allow up to 3 consecutive errors before failing
 
@@ -1920,10 +1926,11 @@ class GenerationHandler:
             if elapsed_time > timeout:
                 raise Exception(f"Cameo processing timeout after {elapsed_time:.1f} seconds")
 
+            poll_interval = random.uniform(poll_min, poll_max)
             await asyncio.sleep(poll_interval)
 
             try:
-                status = await self.sora_client.get_cameo_status(cameo_id, token)
+                status = await self.sora_client.get_cameo_status(cameo_id, token, apply_delay=False)
                 current_status = status.get("status")
                 status_message = status.get("status_message", "")
 

@@ -2,24 +2,38 @@
 import jwt
 import asyncio
 import random
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, AsyncIterator
 from curl_cffi.requests import AsyncSession
 from faker import Faker
 from ..core.database import Database
 from ..core.models import Token, TokenStats
 from ..core.config import config
 from .proxy_manager import ProxyManager
+from .concurrency_manager import ConcurrencyManager
 from ..core.logger import debug_logger
 
 class TokenManager:
     """Token lifecycle manager"""
 
-    def __init__(self, db: Database):
+    def __init__(self, db: Database, concurrency_manager: Optional[ConcurrencyManager] = None):
         self.db = db
         self._lock = asyncio.Lock()
         self.proxy_manager = ProxyManager(db)
         self.fake = Faker()
+        self.concurrency_manager = concurrency_manager
+
+    @asynccontextmanager
+    async def _request_slot(self) -> AsyncIterator[None]:
+        if self.concurrency_manager:
+            await self.concurrency_manager.acquire_request_slot()
+            try:
+                yield
+            finally:
+                await self.concurrency_manager.release_request_slot()
+        else:
+            yield
     
     async def decode_jwt(self, token: str) -> dict:
         """Decode JWT token without verification"""
@@ -63,41 +77,42 @@ class TokenManager:
         """Get user info from Sora API"""
         proxy_url = await self.proxy_manager.get_proxy_url(token_id, proxy_url)
 
-        async with AsyncSession() as session:
-            headers = {
-                "Authorization": f"Bearer {access_token}",
-                "Accept": "application/json",
-                "Origin": "https://sora.chatgpt.com",
-                "Referer": "https://sora.chatgpt.com/"
-            }
+        async with self._request_slot():
+            async with AsyncSession() as session:
+                headers = {
+                    "Authorization": f"Bearer {access_token}",
+                    "Accept": "application/json",
+                    "Origin": "https://sora.chatgpt.com",
+                    "Referer": "https://sora.chatgpt.com/"
+                }
 
-            kwargs = {
-                "headers": headers,
-                "timeout": 30,
-                "impersonate": "chrome"  # 自动生成 User-Agent 和浏览器指纹
-            }
+                kwargs = {
+                    "headers": headers,
+                    "timeout": 30,
+                    "impersonate": "chrome"  # 自动生成 User-Agent 和浏览器指纹
+                }
 
-            if proxy_url:
-                kwargs["proxy"] = proxy_url
+                if proxy_url:
+                    kwargs["proxy"] = proxy_url
 
-            response = await session.get(
-                f"{config.sora_base_url}/me",
-                **kwargs
-            )
+                response = await session.get(
+                    f"{config.sora_base_url}/me",
+                    **kwargs
+                )
 
-            if response.status_code != 200:
-                # Check for token_invalidated error
-                if response.status_code == 401:
-                    try:
-                        error_data = response.json()
-                        error_code = error_data.get("error", {}).get("code", "")
-                        if error_code == "token_invalidated":
-                            raise ValueError(f"401 token_invalidated: Token has been invalidated")
-                    except (ValueError, KeyError):
-                        pass
-                raise ValueError(f"Failed to get user info: {response.status_code}")
+                if response.status_code != 200:
+                    # Check for token_invalidated error
+                    if response.status_code == 401:
+                        try:
+                            error_data = response.json()
+                            error_code = error_data.get("error", {}).get("code", "")
+                            if error_code == "token_invalidated":
+                                raise ValueError(f"401 token_invalidated: Token has been invalidated")
+                        except (ValueError, KeyError):
+                            pass
+                    raise ValueError(f"Failed to get user info: {response.status_code}")
 
-            return response.json()
+                return response.json()
 
     async def get_subscription_info(self, token: str, token_id: Optional[int] = None, proxy_url: Optional[str] = None) -> Dict[str, Any]:
         """Get subscription information from Sora API
@@ -116,23 +131,24 @@ class TokenManager:
             "Authorization": f"Bearer {token}"
         }
 
-        async with AsyncSession() as session:
-            url = "https://sora.chatgpt.com/backend/billing/subscriptions"
-            print(f"📡 请求 URL: {url}")
-            print(f"🔑 使用 Token: {token[:30]}...")
+        async with self._request_slot():
+            async with AsyncSession() as session:
+                url = "https://sora.chatgpt.com/backend/billing/subscriptions"
+                print(f"📡 请求 URL: {url}")
+                print(f"🔑 使用 Token: {token[:30]}...")
 
-            kwargs = {
-                "headers": headers,
-                "timeout": 30,
-                "impersonate": "chrome"  # 自动生成 User-Agent 和浏览器指纹
-            }
+                kwargs = {
+                    "headers": headers,
+                    "timeout": 30,
+                    "impersonate": "chrome"  # 自动生成 User-Agent 和浏览器指纹
+                }
 
-            if proxy_url:
-                kwargs["proxy"] = proxy_url
-                print(f"🌐 使用代理: {proxy_url}")
+                if proxy_url:
+                    kwargs["proxy"] = proxy_url
+                    print(f"🌐 使用代理: {proxy_url}")
 
-            response = await session.get(url, **kwargs)
-            print(f"📥 响应状态码: {response.status_code}")
+                response = await session.get(url, **kwargs)
+                print(f"📥 响应状态码: {response.status_code}")
 
             if response.status_code == 200:
                 data = response.json()
@@ -178,28 +194,29 @@ class TokenManager:
 
         print(f"🔍 开始获取Sora2邀请码...")
 
-        async with AsyncSession() as session:
-            headers = {
-                "Authorization": f"Bearer {access_token}",
-                "Accept": "application/json"
-            }
+        async with self._request_slot():
+            async with AsyncSession() as session:
+                headers = {
+                    "Authorization": f"Bearer {access_token}",
+                    "Accept": "application/json"
+                }
 
-            kwargs = {
-                "headers": headers,
-                "timeout": 30,
-                "impersonate": "chrome"  # 自动生成 User-Agent 和浏览器指纹
-            }
+                kwargs = {
+                    "headers": headers,
+                    "timeout": 30,
+                    "impersonate": "chrome"  # 自动生成 User-Agent 和浏览器指纹
+                }
 
-            if proxy_url:
-                kwargs["proxy"] = proxy_url
-                print(f"🌐 使用代理: {proxy_url}")
+                if proxy_url:
+                    kwargs["proxy"] = proxy_url
+                    print(f"🌐 使用代理: {proxy_url}")
 
-            response = await session.get(
-                "https://sora.chatgpt.com/backend/project_y/invite/mine",
-                **kwargs
-            )
+                response = await session.get(
+                    "https://sora.chatgpt.com/backend/project_y/invite/mine",
+                    **kwargs
+                )
 
-            print(f"📥 响应状态码: {response.status_code}")
+                print(f"📥 响应状态码: {response.status_code}")
 
             if response.status_code == 200:
                 data = response.json()
@@ -286,29 +303,30 @@ class TokenManager:
 
         print(f"🔍 开始获取Sora2剩余次数...")
 
-        async with AsyncSession() as session:
-            headers = {
-                "Authorization": f"Bearer {access_token}",
-                "Accept": "application/json",
-                "User-Agent" : "Sora/1.2026.007 (Android 15; 24122RKC7C; build 2600700)"
-            }
+        async with self._request_slot():
+            async with AsyncSession() as session:
+                headers = {
+                    "Authorization": f"Bearer {access_token}",
+                    "Accept": "application/json",
+                    "User-Agent" : "Sora/1.2026.007 (Android 15; 24122RKC7C; build 2600700)"
+                }
 
-            kwargs = {
-                "headers": headers,
-                "timeout": 30,
-                "impersonate": "chrome"  # 自动生成 User-Agent 和浏览器指纹
-            }
+                kwargs = {
+                    "headers": headers,
+                    "timeout": 30,
+                    "impersonate": "chrome"  # 自动生成 User-Agent 和浏览器指纹
+                }
 
-            if proxy_url:
-                kwargs["proxy"] = proxy_url
-                print(f"🌐 使用代理: {proxy_url}")
+                if proxy_url:
+                    kwargs["proxy"] = proxy_url
+                    print(f"🌐 使用代理: {proxy_url}")
 
-            response = await session.get(
-                "https://sora.chatgpt.com/backend/nf/check",
-                **kwargs
-            )
+                response = await session.get(
+                    "https://sora.chatgpt.com/backend/nf/check",
+                    **kwargs
+                )
 
-            print(f"📥 响应状态码: {response.status_code}")
+                print(f"📥 响应状态码: {response.status_code}")
 
             if response.status_code == 200:
                 data = response.json()
@@ -344,29 +362,30 @@ class TokenManager:
 
         print(f"🔍 检查用户名是否可用: {username}")
 
-        async with AsyncSession() as session:
-            headers = {
-                "Authorization": f"Bearer {access_token}",
-                "Content-Type": "application/json"
-            }
+        async with self._request_slot():
+            async with AsyncSession() as session:
+                headers = {
+                    "Authorization": f"Bearer {access_token}",
+                    "Content-Type": "application/json"
+                }
 
-            kwargs = {
-                "headers": headers,
-                "json": {"username": username},
-                "timeout": 30,
-                "impersonate": "chrome"
-            }
+                kwargs = {
+                    "headers": headers,
+                    "json": {"username": username},
+                    "timeout": 30,
+                    "impersonate": "chrome"
+                }
 
-            if proxy_url:
-                kwargs["proxy"] = proxy_url
-                print(f"🌐 使用代理: {proxy_url}")
+                if proxy_url:
+                    kwargs["proxy"] = proxy_url
+                    print(f"🌐 使用代理: {proxy_url}")
 
-            response = await session.post(
-                "https://sora.chatgpt.com/backend/project_y/profile/username/check",
-                **kwargs
-            )
+                response = await session.post(
+                    "https://sora.chatgpt.com/backend/project_y/profile/username/check",
+                    **kwargs
+                )
 
-            print(f"📥 响应状态码: {response.status_code}")
+                print(f"📥 响应状态码: {response.status_code}")
 
             if response.status_code == 200:
                 data = response.json()
@@ -392,29 +411,30 @@ class TokenManager:
 
         print(f"🔍 开始设置用户名: {username}")
 
-        async with AsyncSession() as session:
-            headers = {
-                "Authorization": f"Bearer {access_token}",
-                "Content-Type": "application/json"
-            }
+        async with self._request_slot():
+            async with AsyncSession() as session:
+                headers = {
+                    "Authorization": f"Bearer {access_token}",
+                    "Content-Type": "application/json"
+                }
 
-            kwargs = {
-                "headers": headers,
-                "json": {"username": username},
-                "timeout": 30,
-                "impersonate": "chrome"
-            }
+                kwargs = {
+                    "headers": headers,
+                    "json": {"username": username},
+                    "timeout": 30,
+                    "impersonate": "chrome"
+                }
 
-            if proxy_url:
-                kwargs["proxy"] = proxy_url
-                print(f"🌐 使用代理: {proxy_url}")
+                if proxy_url:
+                    kwargs["proxy"] = proxy_url
+                    print(f"🌐 使用代理: {proxy_url}")
 
-            response = await session.post(
-                "https://sora.chatgpt.com/backend/project_y/profile/username/set",
-                **kwargs
-            )
+                response = await session.post(
+                    "https://sora.chatgpt.com/backend/project_y/profile/username/set",
+                    **kwargs
+                )
 
-            print(f"📥 响应状态码: {response.status_code}")
+                print(f"📥 响应状态码: {response.status_code}")
 
             if response.status_code == 200:
                 data = response.json()
@@ -433,36 +453,37 @@ class TokenManager:
         print(f"🔍 开始激活Sora2邀请码: {invite_code}")
         print(f"🔑 Access Token 前缀: {access_token[:50]}...")
 
-        async with AsyncSession() as session:
-            # 生成设备ID
-            device_id = str(uuid.uuid4())
+        async with self._request_slot():
+            async with AsyncSession() as session:
+                # 生成设备ID
+                device_id = str(uuid.uuid4())
 
-            # 只设置必要的头，让 impersonate 处理其他
-            headers = {
-                "authorization": f"Bearer {access_token}",
-                "cookie": f"oai-did={device_id}"
-            }
+                # 只设置必要的头，让 impersonate 处理其他
+                headers = {
+                    "authorization": f"Bearer {access_token}",
+                    "cookie": f"oai-did={device_id}"
+                }
 
-            print(f"🆔 设备ID: {device_id}")
-            print(f"📦 请求体: {{'invite_code': '{invite_code}'}}")
+                print(f"🆔 设备ID: {device_id}")
+                print(f"📦 请求体: {{'invite_code': '{invite_code}'}}")
 
-            kwargs = {
-                "headers": headers,
-                "json": {"invite_code": invite_code},
-                "timeout": 30,
-                "impersonate": "chrome120"  # 使用 chrome120 让库自动处理 UA 等头
-            }
+                kwargs = {
+                    "headers": headers,
+                    "json": {"invite_code": invite_code},
+                    "timeout": 30,
+                    "impersonate": "chrome120"  # 使用 chrome120 让库自动处理 UA 等头
+                }
 
-            if proxy_url:
-                kwargs["proxy"] = proxy_url
-                print(f"🌐 使用代理: {proxy_url}")
+                if proxy_url:
+                    kwargs["proxy"] = proxy_url
+                    print(f"🌐 使用代理: {proxy_url}")
 
-            response = await session.post(
-                "https://sora.chatgpt.com/backend/project_y/invite/accept",
-                **kwargs
-            )
+                response = await session.post(
+                    "https://sora.chatgpt.com/backend/project_y/invite/accept",
+                    **kwargs
+                )
 
-            print(f"📥 响应状态码: {response.status_code}")
+                print(f"📥 响应状态码: {response.status_code}")
 
             if response.status_code == 200:
                 data = response.json()
@@ -481,80 +502,81 @@ class TokenManager:
         debug_logger.log_info(f"[ST_TO_AT] 开始转换 Session Token 为 Access Token...")
         proxy_url = await self.proxy_manager.get_proxy_url(proxy_url=proxy_url)
 
-        async with AsyncSession() as session:
-            headers = {
-                "Cookie": f"__Secure-next-auth.session-token={session_token}",
-                "Accept": "application/json",
-                "Origin": "https://sora.chatgpt.com",
-                "Referer": "https://sora.chatgpt.com/"
-            }
+        async with self._request_slot():
+            async with AsyncSession() as session:
+                headers = {
+                    "Cookie": f"__Secure-next-auth.session-token={session_token}",
+                    "Accept": "application/json",
+                    "Origin": "https://sora.chatgpt.com",
+                    "Referer": "https://sora.chatgpt.com/"
+                }
 
-            kwargs = {
-                "headers": headers,
-                "timeout": 30,
-                "impersonate": "chrome"  # 自动生成 User-Agent 和浏览器指纹
-            }
+                kwargs = {
+                    "headers": headers,
+                    "timeout": 30,
+                    "impersonate": "chrome"  # 自动生成 User-Agent 和浏览器指纹
+                }
 
-            if proxy_url:
-                kwargs["proxy"] = proxy_url
-                debug_logger.log_info(f"[ST_TO_AT] 使用代理: {proxy_url}")
+                if proxy_url:
+                    kwargs["proxy"] = proxy_url
+                    debug_logger.log_info(f"[ST_TO_AT] 使用代理: {proxy_url}")
 
-            url = "https://sora.chatgpt.com/api/auth/session"
-            debug_logger.log_info(f"[ST_TO_AT] 📡 请求 URL: {url}")
-
-            try:
-                response = await session.get(url, **kwargs)
-                debug_logger.log_info(f"[ST_TO_AT] 📥 响应状态码: {response.status_code}")
-
-                if response.status_code != 200:
-                    error_msg = f"Failed to convert ST to AT: {response.status_code}"
-                    debug_logger.log_info(f"[ST_TO_AT] ❌ {error_msg}")
-                    debug_logger.log_info(f"[ST_TO_AT] 响应内容: {response.text[:500]}")
-                    raise ValueError(error_msg)
-
-                # 获取响应文本用于调试
-                response_text = response.text
-                debug_logger.log_info(f"[ST_TO_AT] 📄 响应内容: {response_text[:500]}")
-
-                # 检查响应是否为空
-                if not response_text or response_text.strip() == "":
-                    debug_logger.log_info(f"[ST_TO_AT] ❌ 响应体为空")
-                    raise ValueError("Response body is empty")
+                url = "https://sora.chatgpt.com/api/auth/session"
+                debug_logger.log_info(f"[ST_TO_AT] 📡 请求 URL: {url}")
 
                 try:
-                    data = response.json()
-                except Exception as json_err:
-                    debug_logger.log_info(f"[ST_TO_AT] ❌ JSON解析失败: {str(json_err)}")
-                    debug_logger.log_info(f"[ST_TO_AT] 原始响应: {response_text[:1000]}")
-                    raise ValueError(f"Failed to parse JSON response: {str(json_err)}")
+                    response = await session.get(url, **kwargs)
+                    debug_logger.log_info(f"[ST_TO_AT] 📥 响应状态码: {response.status_code}")
 
-                # 检查data是否为None
-                if data is None:
-                    debug_logger.log_info(f"[ST_TO_AT] ❌ 响应JSON为空")
-                    raise ValueError("Response JSON is empty")
+                    if response.status_code != 200:
+                        error_msg = f"Failed to convert ST to AT: {response.status_code}"
+                        debug_logger.log_info(f"[ST_TO_AT] ❌ {error_msg}")
+                        debug_logger.log_info(f"[ST_TO_AT] 响应内容: {response.text[:500]}")
+                        raise ValueError(error_msg)
 
-                access_token = data.get("accessToken")
-                email = data.get("user", {}).get("email") if data.get("user") else None
-                expires = data.get("expires")
+                    # 获取响应文本用于调试
+                    response_text = response.text
+                    debug_logger.log_info(f"[ST_TO_AT] 📄 响应内容: {response_text[:500]}")
 
-                # 检查必要字段
-                if not access_token:
-                    debug_logger.log_info(f"[ST_TO_AT] ❌ 响应中缺少 accessToken 字段")
-                    debug_logger.log_info(f"[ST_TO_AT] 响应数据: {data}")
-                    raise ValueError("Missing accessToken in response")
+                    # 检查响应是否为空
+                    if not response_text or response_text.strip() == "":
+                        debug_logger.log_info(f"[ST_TO_AT] ❌ 响应体为空")
+                        raise ValueError("Response body is empty")
 
-                debug_logger.log_info(f"[ST_TO_AT] ✅ ST 转换成功")
-                debug_logger.log_info(f"  - Email: {email}")
-                debug_logger.log_info(f"  - 过期时间: {expires}")
+                    try:
+                        data = response.json()
+                    except Exception as json_err:
+                        debug_logger.log_info(f"[ST_TO_AT] ❌ JSON解析失败: {str(json_err)}")
+                        debug_logger.log_info(f"[ST_TO_AT] 原始响应: {response_text[:1000]}")
+                        raise ValueError(f"Failed to parse JSON response: {str(json_err)}")
 
-                return {
-                    "access_token": access_token,
-                    "email": email,
-                    "expires": expires
-                }
-            except Exception as e:
-                debug_logger.log_info(f"[ST_TO_AT] 🔴 异常: {str(e)}")
-                raise
+                    # 检查data是否为None
+                    if data is None:
+                        debug_logger.log_info(f"[ST_TO_AT] ❌ 响应JSON为空")
+                        raise ValueError("Response JSON is empty")
+
+                    access_token = data.get("accessToken")
+                    email = data.get("user", {}).get("email") if data.get("user") else None
+                    expires = data.get("expires")
+
+                    # 检查必要字段
+                    if not access_token:
+                        debug_logger.log_info(f"[ST_TO_AT] ❌ 响应中缺少 accessToken 字段")
+                        debug_logger.log_info(f"[ST_TO_AT] 响应数据: {data}")
+                        raise ValueError("Missing accessToken in response")
+
+                    debug_logger.log_info(f"[ST_TO_AT] ✅ ST 转换成功")
+                    debug_logger.log_info(f"  - Email: {email}")
+                    debug_logger.log_info(f"  - 过期时间: {expires}")
+
+                    return {
+                        "access_token": access_token,
+                        "email": email,
+                        "expires": expires
+                    }
+                except Exception as e:
+                    debug_logger.log_info(f"[ST_TO_AT] 🔴 异常: {str(e)}")
+                    raise
     
     async def rt_to_at(self, refresh_token: str, client_id: Optional[str] = None, proxy_url: Optional[str] = None) -> dict:
         """Convert Refresh Token to Access Token
@@ -571,81 +593,82 @@ class TokenManager:
         debug_logger.log_info(f"[RT_TO_AT] 使用 Client ID: {effective_client_id[:20]}...")
         proxy_url = await self.proxy_manager.get_proxy_url(proxy_url=proxy_url)
 
-        async with AsyncSession() as session:
-            headers = {
-                "Accept": "application/json",
-                "Content-Type": "application/json"
-            }
+        async with self._request_slot():
+            async with AsyncSession() as session:
+                headers = {
+                    "Accept": "application/json",
+                    "Content-Type": "application/json"
+                }
 
-            kwargs = {
-                "headers": headers,
-                "json": {
-                    "client_id": effective_client_id,
-                    "grant_type": "refresh_token",
-                    "redirect_uri": "com.openai.chat://auth0.openai.com/ios/com.openai.chat/callback",
-                    "refresh_token": refresh_token
-                },
-                "timeout": 30,
-                "impersonate": "chrome"  # 自动生成 User-Agent 和浏览器指纹
-            }
+                kwargs = {
+                    "headers": headers,
+                    "json": {
+                        "client_id": effective_client_id,
+                        "grant_type": "refresh_token",
+                        "redirect_uri": "com.openai.chat://auth0.openai.com/ios/com.openai.chat/callback",
+                        "refresh_token": refresh_token
+                    },
+                    "timeout": 30,
+                    "impersonate": "chrome"  # 自动生成 User-Agent 和浏览器指纹
+                }
 
-            if proxy_url:
-                kwargs["proxy"] = proxy_url
-                debug_logger.log_info(f"[RT_TO_AT] 使用代理: {proxy_url}")
+                if proxy_url:
+                    kwargs["proxy"] = proxy_url
+                    debug_logger.log_info(f"[RT_TO_AT] 使用代理: {proxy_url}")
 
-            url = "https://auth.openai.com/oauth/token"
-            debug_logger.log_info(f"[RT_TO_AT] 📡 请求 URL: {url}")
-
-            try:
-                response = await session.post(url, **kwargs)
-                debug_logger.log_info(f"[RT_TO_AT] 📥 响应状态码: {response.status_code}")
-
-                if response.status_code != 200:
-                    error_msg = f"Failed to convert RT to AT: {response.status_code}"
-                    debug_logger.log_info(f"[RT_TO_AT] ❌ {error_msg}")
-                    debug_logger.log_info(f"[RT_TO_AT] 响应内容: {response.text[:500]}")
-                    raise ValueError(f"{error_msg} - {response.text}")
-
-                # 获取响应文本用于调试
-                response_text = response.text
-                debug_logger.log_info(f"[RT_TO_AT] 📄 响应内容: {response_text[:500]}")
-
-                # 检查响应是否为空
-                if not response_text or response_text.strip() == "":
-                    debug_logger.log_info(f"[RT_TO_AT] ❌ 响应体为空")
-                    raise ValueError("Response body is empty")
+                url = "https://auth.openai.com/oauth/token"
+                debug_logger.log_info(f"[RT_TO_AT] 📡 请求 URL: {url}")
 
                 try:
-                    data = response.json()
-                except Exception as json_err:
-                    debug_logger.log_info(f"[RT_TO_AT] ❌ JSON解析失败: {str(json_err)}")
-                    debug_logger.log_info(f"[RT_TO_AT] 原始响应: {response_text[:1000]}")
-                    raise ValueError(f"Failed to parse JSON response: {str(json_err)}")
+                    response = await session.post(url, **kwargs)
+                    debug_logger.log_info(f"[RT_TO_AT] 📥 响应状态码: {response.status_code}")
 
-                # 检查data是否为None
-                if data is None:
-                    debug_logger.log_info(f"[RT_TO_AT] ❌ 响应JSON为空")
-                    raise ValueError("Response JSON is empty")
+                    if response.status_code != 200:
+                        error_msg = f"Failed to convert RT to AT: {response.status_code}"
+                        debug_logger.log_info(f"[RT_TO_AT] ❌ {error_msg}")
+                        debug_logger.log_info(f"[RT_TO_AT] 响应内容: {response.text[:500]}")
+                        raise ValueError(f"{error_msg} - {response.text}")
 
-                access_token = data.get("access_token")
-                new_refresh_token = data.get("refresh_token")
-                expires_in = data.get("expires_in")
+                    # 获取响应文本用于调试
+                    response_text = response.text
+                    debug_logger.log_info(f"[RT_TO_AT] 📄 响应内容: {response_text[:500]}")
 
-                # 检查必要字段
-                if not access_token:
-                    debug_logger.log_info(f"[RT_TO_AT] ❌ 响应中缺少 access_token 字段")
-                    debug_logger.log_info(f"[RT_TO_AT] 响应数据: {data}")
-                    raise ValueError("Missing access_token in response")
+                    # 检查响应是否为空
+                    if not response_text or response_text.strip() == "":
+                        debug_logger.log_info(f"[RT_TO_AT] ❌ 响应体为空")
+                        raise ValueError("Response body is empty")
 
-                debug_logger.log_info(f"[RT_TO_AT] ✅ RT 转换成功")
-                debug_logger.log_info(f"  - 新 Access Token 有效期: {expires_in} 秒")
-                debug_logger.log_info(f"  - Refresh Token 已更新: {'是' if new_refresh_token else '否'}")
+                    try:
+                        data = response.json()
+                    except Exception as json_err:
+                        debug_logger.log_info(f"[RT_TO_AT] ❌ JSON解析失败: {str(json_err)}")
+                        debug_logger.log_info(f"[RT_TO_AT] 原始响应: {response_text[:1000]}")
+                        raise ValueError(f"Failed to parse JSON response: {str(json_err)}")
 
-                return {
-                    "access_token": access_token,
-                    "refresh_token": new_refresh_token,
-                    "expires_in": expires_in
-                }
+                    # 检查data是否为None
+                    if data is None:
+                        debug_logger.log_info(f"[RT_TO_AT] ❌ 响应JSON为空")
+                        raise ValueError("Response JSON is empty")
+
+                    access_token = data.get("access_token")
+                    new_refresh_token = data.get("refresh_token")
+                    expires_in = data.get("expires_in")
+
+                    # 检查必要字段
+                    if not access_token:
+                        debug_logger.log_info(f"[RT_TO_AT] ❌ 响应中缺少 access_token 字段")
+                        debug_logger.log_info(f"[RT_TO_AT] 响应数据: {data}")
+                        raise ValueError("Missing access_token in response")
+
+                    debug_logger.log_info(f"[RT_TO_AT] ✅ RT 转换成功")
+                    debug_logger.log_info(f"  - 新 Access Token 有效期: {expires_in} 秒")
+                    debug_logger.log_info(f"  - Refresh Token 已更新: {'是' if new_refresh_token else '否'}")
+
+                    return {
+                        "access_token": access_token,
+                        "refresh_token": new_refresh_token,
+                        "expires_in": expires_in
+                    }
             except Exception as e:
                 debug_logger.log_info(f"[RT_TO_AT] 🔴 异常: {str(e)}")
                 raise

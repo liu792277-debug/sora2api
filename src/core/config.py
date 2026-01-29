@@ -56,6 +56,18 @@ class Config:
     @property
     def poll_interval(self) -> float:
         return self._config["sora"]["poll_interval"]
+
+    @property
+    def poll_interval_min(self) -> float:
+        """Get minimum poll interval in seconds."""
+        return float(self._config.get("sora", {}).get("poll_interval_min_seconds", self._config.get("sora", {}).get("poll_interval", 10)))
+
+    @property
+    def poll_interval_max(self) -> float:
+        """Get maximum poll interval in seconds."""
+        minimum = self.poll_interval_min
+        maximum = float(self._config.get("sora", {}).get("poll_interval_max_seconds", minimum))
+        return max(minimum, maximum)
     
     @property
     def max_poll_attempts(self) -> int:
@@ -216,12 +228,12 @@ class Config:
     @property
     def request_start_delay_min(self) -> float:
         """Get minimum delay between request starts in seconds"""
-        return float(self._config.get("request_limits", {}).get("start_delay_min_seconds", 5))
+        return float(self._config.get("request_limits", {}).get("start_delay_min_seconds", 8))
 
     @property
     def request_start_delay_max(self) -> float:
         """Get maximum delay between request starts in seconds"""
-        return float(self._config.get("request_limits", {}).get("start_delay_max_seconds", 15))
+        return float(self._config.get("request_limits", {}).get("start_delay_max_seconds", 13))
 
 # Global config instance
 config = Config()
