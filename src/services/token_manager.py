@@ -669,9 +669,9 @@ class TokenManager:
                         "refresh_token": new_refresh_token,
                         "expires_in": expires_in
                     }
-            except Exception as e:
-                debug_logger.log_info(f"[RT_TO_AT] 🔴 异常: {str(e)}")
-                raise
+                except Exception as e:
+                    debug_logger.log_info(f"[RT_TO_AT] 🔴 异常: {str(e)}")
+                    raise
     
     async def add_token(self, token_value: str,
                        st: Optional[str] = None,
