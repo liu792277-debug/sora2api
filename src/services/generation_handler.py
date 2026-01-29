@@ -732,6 +732,9 @@ class GenerationHandler:
             watermark_free_config = await self.db.get_watermark_free_config()
             debug_logger.log_info(f"Watermark-free mode: {'ENABLED' if watermark_free_config.watermark_free_enabled else 'DISABLED'}")
 
+        if poll_max > 0:
+            await asyncio.sleep(random.uniform(poll_min, poll_max))
+
         for attempt in range(max_attempts):
             # Check if timeout exceeded
             elapsed_time = time.time() - start_time
@@ -769,11 +772,6 @@ class GenerationHandler:
                     )
 
                 raise Exception(f"Upstream API timeout: Generation exceeded {timeout} seconds limit")
-
-
-            poll_interval = random.uniform(poll_min, poll_max)
-            await asyncio.sleep(poll_interval)
-
             try:
                 if is_video:
                     # Get pending tasks to check progress
@@ -1157,6 +1155,9 @@ class GenerationHandler:
                         yield self._format_stream_chunk(
                             reasoning_content=f"**Processing**\n\nGeneration in progress: {estimated_progress:.0f}% completed (estimated)...\n"
                         )
+
+                if poll_max > 0:
+                    await asyncio.sleep(random.uniform(poll_min, poll_max))
             
             except Exception as e:
                 # Check for CF shield/429 error - don't retry these
@@ -1920,14 +1921,16 @@ class GenerationHandler:
         max_attempts = int(timeout / base_interval)
         consecutive_errors = 0
         max_consecutive_errors = 3  # Allow up to 3 consecutive errors before failing
+        last_poll_delay = base_interval
+
+        if poll_max > 0:
+            last_poll_delay = random.uniform(poll_min, poll_max)
+            await asyncio.sleep(last_poll_delay)
 
         for attempt in range(max_attempts):
             elapsed_time = time.time() - start_time
             if elapsed_time > timeout:
                 raise Exception(f"Cameo processing timeout after {elapsed_time:.1f} seconds")
-
-            poll_interval = random.uniform(poll_min, poll_max)
-            await asyncio.sleep(poll_interval)
 
             try:
                 status = await self.sora_client.get_cameo_status(cameo_id, token, apply_delay=False)
@@ -1960,6 +1963,10 @@ class GenerationHandler:
                     debug_logger.log_info(f"Cameo processing completed (status: {current_status}, message: {status_message})")
                     return status
 
+                if poll_max > 0:
+                    last_poll_delay = random.uniform(poll_min, poll_max)
+                    await asyncio.sleep(last_poll_delay)
+
             except Exception as e:
                 consecutive_errors += 1
                 error_msg = str(e)
@@ -1981,7 +1988,7 @@ class GenerationHandler:
 
                 if is_tls_error:
                     # For TLS errors, use exponential backoff
-                    backoff_time = min(poll_interval * (2 ** (consecutive_errors - 1)), 30)
+                    backoff_time = min(last_poll_delay * (2 ** (consecutive_errors - 1)), 30)
                     debug_logger.log_info(f"TLS error detected, using exponential backoff: {backoff_time}s")
                     await asyncio.sleep(backoff_time)
 
@@ -1990,6 +1997,9 @@ class GenerationHandler:
                     raise Exception(f"Too many consecutive errors ({consecutive_errors}) while polling cameo status: {error_msg}")
 
                 # Continue polling on error
+                if poll_max > 0:
+                    last_poll_delay = random.uniform(poll_min, poll_max)
+                    await asyncio.sleep(last_poll_delay)
                 continue
 
         raise Exception(f"Cameo processing timeout after {timeout} seconds")
